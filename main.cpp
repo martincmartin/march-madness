@@ -9,6 +9,10 @@
 // -I/opt/homebrew/opt/curl/include -L/opt/homebrew/opt/curl/lib
 // -I/opt/homebrew/opt/nlohmann-json/include -lcurl -lfmt main.cpp && time
 // ./a.out
+
+// NOTE: Match, matchup and game are used interchangeably in this code.  Should
+// probably standardize on match.  Oh well.
+
 #include <cstdlib>
 #include <vector>
 #include <iostream>
@@ -18,7 +22,8 @@
 #include <fmt/format.h>
 #include <bitset>
 #include <unordered_set>
-#include <folly/lang/Bits.h>
+#include <bit>
+#include <curl/curl.h>
 
 constexpr size_t NUM_TEAMS = 64;
 constexpr size_t NUM_GAMES = NUM_TEAMS - 1;
@@ -33,7 +38,9 @@ using namespace std;
 using namespace std::chrono;
 using json = nlohmann::json;
 
-array<uint64_t, 8> entries{
+constexpr size_t NUM_BRACKETS = 8;
+
+array<uint64_t, NUM_BRACKETS> entries{
     60122219, // me, Hoops, There It Is! (Martin, martinisquared)
     62328104, // Tara, TheGambler46
     58407997, // Dan (Dan Murphy, dmurph888)
@@ -53,19 +60,7 @@ void assert_failed(const char *expr)
 
 #define myassert(expr) ((expr) ? (void)0 : assert_failed(#expr))
 
-#include <curl/curl.h>
-
-// Uses all_selections.
-
-constexpr size_t NUM_OTHER1 = 34588;
-constexpr size_t NUM_OTHER2 = 1109582;
-
-constexpr size_t NUM_BRACKETS = 8;
-
-int randint(int max)
-{
-   return random() % max;
-}
+/**********  Fetch a web page, extract & parse JSON  **********/
 
 size_t write_callback(char *buffer, size_t size, size_t nmemb, void *user_data)
 {
@@ -135,6 +130,8 @@ json get_json(const string &var, const string &source)
    return json::parse(raw);
 }
 
+/**********  Manipulate indexes of matches  **********/
+
 struct Round
 {
    int round;
@@ -145,9 +142,9 @@ struct Round
 
 inline Round round_index(int match)
 {
-   assert(1 <= match && match <= NUM_GAMES);
-   // For x > 0, findLastSet(x) == 1 + floor(log2(x)).
-   int round = folly::findLastSet(64 - match) - 1;
+   myassert(1 <= match && match <= NUM_GAMES);
+   // For x > 0, bit_width(x) == 1 + floor(log2(x)).
+   int round = bit_width((uint8_t)(64 - match)) - 1;
    int num_matches = (1 << round);
    int num_teams = num_matches * 2;
    return Round{round, num_teams, num_matches, num_teams - (64 - match)};
@@ -160,7 +157,15 @@ int match(int round, int index)
    return index + 64 - (1 << (round + 1));
 }
 
-array<int, 63> points_per_match{
+int input(int index)
+{
+   Round round_details = round_index(index + 1);
+   int inputRound = round_details.round + 1; // + 1 for previous round.
+   int inputRoundIndex = round_details.index * 2 - 1;
+   return match(inputRound, inputRoundIndex) - 1;
+}
+
+array<int, NUM_GAMES> points_per_match{
     // Round of 64
     10, 10, 10, 10, 10, 10, 10, 10,
     10, 10, 10, 10, 10, 10, 10, 10,
@@ -178,14 +183,9 @@ array<int, 63> points_per_match{
     // Championship
     320};
 
-int input(int index)
-{
-   Round round_details = round_index(index + 1);
-   int inputRound = round_details.round + 1; // + 1 for previous round.
-   int inputRoundIndex = round_details.index * 2 - 1;
-   return match(inputRound, inputRoundIndex) - 1;
-}
+/**********  Tuples of scores, packed in an int  **********/
 
+// This should probably be a simple class, rather than a typedef.  Oh well.
 using scoretuple_t = uint64_t; // For more than 8 players, need uint128_t.
 static_assert(sizeof(scoretuple_t) >= NUM_BRACKETS);
 
@@ -224,15 +224,7 @@ string make_string(scoretuple_t scores)
    return result + ")";
 }
 
-scoretuple_t random_scoretuple()
-{
-   scoretuple_t result = 0;
-   for (size_t i = 0; i < NUM_BRACKETS; i++)
-   {
-      result = result * 256 + randint(81);
-   }
-   return result;
-}
+/**********  Team, match, bracket  **********/
 
 struct Matchup
 {
@@ -242,7 +234,14 @@ struct Matchup
    team_t winner = -1;
 };
 
-vector<string> teams(64);
+vector<string> teams(NUM_TEAMS);
+
+string to_string(const Matchup &matchup)
+{
+   return to_string(matchup.id) + ": " +
+          teams[matchup.first_team] + ", " + teams[matchup.second_team] + ", " +
+          (matchup.winner >= 0 ? teams[matchup.winner] : "None");
+}
 
 Matchup parse_matchup(const json &matchup)
 {
@@ -276,13 +275,33 @@ struct Bracket
 
 vector<Bracket> brackets;
 
-vector<bitset<64>> all_selections(NUM_GAMES);
+vector<bitset<NUM_TEAMS>> all_selections(NUM_GAMES);
+
+string to_string(const bitset<NUM_TEAMS> selections)
+{
+   string result;
+   bool first = true;
+   for (size_t i = 0; i < selections.size(); ++i)
+   {
+      if (selections[i])
+      {
+         if (!first)
+         {
+            result += ", ";
+         }
+         result += teams[i];
+         first = false;
+      }
+   }
+   return result;
+}
 
 Bracket get_bracket(uint64_t entry)
 {
    Bracket result;
    string html = get_entry(entry);
    result.name = get_json("espn.fantasy.maxpart.config.Entry", html)["n_e"];
+   // Get rid of some Unicode.
    if (result.name.starts_with("Owe"))
    {
       result.name = "Owe'n Charlie '22";
@@ -291,6 +310,7 @@ Bracket get_bracket(uint64_t entry)
    {
       result.name = "Maureen's Annual Bonus";
    }
+
    auto picks_str = get_json("espn.fantasy.maxpart.config.pickString", html);
    stringstream stream(picks_str.get<string>());
    string item;
@@ -313,6 +333,8 @@ void make_all_selections()
       }
    }
 }
+
+/**********  Outcomes  **********/
 
 scoretuple_t get_scoretuple(game_t match_index, team_t winning_team, uint8_t reduced_points)
 {
@@ -344,7 +366,7 @@ struct Outcomes
 string to_string(const Outcomes &outcome)
 {
    string result;
-   result += (outcome.team < 0 ? "other" : teams[outcome.team]);
+   result += (outcome.team < 0 ? "other" : teams[outcome.team]) + ":";
    for (const auto scores : outcome.scores)
    {
       result += " " + make_string(scores);
@@ -461,11 +483,13 @@ vector<Outcomes> outcomes(
    return result;
 }
 
+/**********  Putting it all together  **********/
+
 int main(int argc, char *argv[])
 {
    string html = get_entry(entries[0]);
    const auto teams_json = get_json("espn.fantasy.maxpart.config.scoreboard_teams", html);
-   myassert(teams_json.size() == 64);
+   myassert(teams_json.size() == NUM_TEAMS);
    for (const auto &team : teams_json)
    {
       teams[team["id"].get<int>() - 1] = team["n"];
@@ -473,7 +497,7 @@ int main(int argc, char *argv[])
 
    const auto matchups_json = get_json("espn.fantasy.maxpart.config.scoreboard_matchups", html);
 
-   myassert(matchups_json.size() == 63);
+   myassert(matchups_json.size() == NUM_GAMES);
    for (const auto &matchup : matchups_json)
    {
       Matchup m = parse_matchup(matchup);
@@ -485,20 +509,11 @@ int main(int argc, char *argv[])
       brackets.push_back(get_bracket(entry));
    }
 
+   myassert(brackets.size() == NUM_BRACKETS);
+
    make_all_selections();
 
-   for (int match_index = 0; match_index < 63; match_index++)
-   {
-      cout << match_index;
-      for (size_t team_index = 0; team_index < 64; ++team_index)
-      {
-         if (all_selections[match_index][team_index])
-         {
-            cout << ", " << teams[team_index];
-         }
-      }
-      cout << "\n";
-   }
+   myassert(all_selections.size() == NUM_GAMES);
 
    {
       cout << "**********  2nd from the top Round of 32 game in the South\n";
@@ -536,44 +551,40 @@ int main(int argc, char *argv[])
       }
    }
 
-   return 0;
-
-   vector<scoretuple_t> other1;
-   for (size_t i = 0; i < NUM_OTHER1; i++)
    {
-      other1.push_back(random_scoretuple());
-   }
-
-   vector<scoretuple_t> other2;
-   for (size_t i = 0; i < NUM_OTHER2; i++)
-   {
-      other2.push_back(random_scoretuple());
-   }
-
-   cout << "Starting loop." << endl;
-   auto start = high_resolution_clock::now();
-   int i = 0;
-   vector<size_t> counts(NUM_BRACKETS);
-   for (auto o1 : other1)
-   {
-      for (auto o2 : other2)
+      cout << "**********  West & East\n";
+      auto west_east = outcomes(60, all_selections[62]);
+      for (const auto &outcome : west_east)
       {
-         const scoretuple_t total = o1 + o2;
-
-         counts[winner(total)]++;
-      }
-      i++;
-      if (i % 500 == 0)
-      {
-         double elapsed = duration_cast<microseconds>(high_resolution_clock::now() - start).count() / 1e6;
-
-         cout << elapsed / i * other1.size() << " " << elapsed / i * (other1.size() - i) << " sec\n";
+         if (!outcome.scores.empty())
+         {
+            cout << (outcome.team < 0 ? "other" : teams[outcome.team]) << ": " << outcome.scores.size() << "\n";
+         }
       }
    }
 
-   for (size_t i = 0; i < NUM_BRACKETS; i++)
    {
-      cout << counts[i] << "\n";
+      cout << "**********  Midwest & South\n";
+      auto midwest_south = outcomes(61, all_selections[62]);
+      for (const auto &outcome : midwest_south)
+      {
+         if (!outcome.scores.empty())
+         {
+            cout << (outcome.team < 0 ? "other" : teams[outcome.team]) << ": " << outcome.scores.size() << "\n";
+         }
+      }
+   }
+
+   {
+      cout << "**********  Whole Thing!\n";
+      auto results = outcomes(62, {});
+      for (const auto &outcome : results)
+      {
+         if (!outcome.scores.empty())
+         {
+            cout << (outcome.team < 0 ? "other" : teams[outcome.team]) << ": " << outcome.scores.size() << "\n";
+         }
+      }
    }
 
    return 0;
