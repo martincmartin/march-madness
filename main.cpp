@@ -1,10 +1,9 @@
 // To compile and run:
 //
-// brew install folly curl nlohmann-json fmt
+// brew install curl nlohmann-json fmt
 // Use "brew --prefix <package>" to find where they're installed.  For me:
 //
 // clang++ -std=gnu++20 -O3 -DNDEBUG -Wall -Werror
-// -I/opt/homebrew/opt/folly/include -L/opt/homebrew/opt/folly/lib
 // -I/opt/homebrew/opt/fmt/include -L/opt/homebrew/opt/fmt/lib
 // -I/opt/homebrew/opt/curl/include -L/opt/homebrew/opt/curl/lib
 // -I/opt/homebrew/opt/nlohmann-json/include -lcurl -lfmt main.cpp && time
@@ -13,9 +12,35 @@
 // NOTE: Match, matchup and game are used interchangeably in this code.  Should
 // probably standardize on match.  Oh well.
 
+// This code runs in reasonable time & RAM after round of 64 / before round of
+// 32.  However, mid round of 64, it's taking over 30 min on my Macbook Air (M1)
+// and using more than 7 of my 8 GB.  Only 6 min was user, 24 min was system.
+// So still not practical.  Could try it on my desktop.  Could always do Monte
+//      Carlo, or trim unlikley outcomes I suppose.  Actually, could do Monte
+//      Carlo just for round 0!  That would solve all possibilities.
+
+// I think we should get our probabilities from 538.  They update them all the
+// time, so e.g. after round of 64 I can get fresh probabilities.  Ken Pomeroy
+// sometimes updates his, but sometimes doesn't, even after first four.  Plus I
+// don't think he ever updates them between rounds of 64 and 32.  URL:
+// https://projects.fivethirtyeight.com/march-madness-api/2022/fivethirtyeight_ncaa_forecasts.csv
+//
+// There doesn't seem to be a standard CSV parsing library in C++.  The answer
+// seems to be, just use ifstream and getline(), i.e. ignore quotes and
+// escaping.  If you need something better, consider rapidcsv from here:
+// https://github.com/d99kris/rapidcsv
+//
+// The "rd?_win" columns seem to be the probability of winning that round.  rd1
+// is the "First Four", where we narrow from 68 to 64.  rd2 is the Round of 64,
+// rd3 is Round of 32.  Just keep the first one you see, i.e. assume the most
+// recent entries are on top.
+//
+// What a pain in the ass to parse all this.
+
 #include <cstdlib>
 #include <vector>
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <regex>
 #include <nlohmann/json.hpp>
@@ -24,14 +49,21 @@
 #include <unordered_set>
 #include <bit>
 #include <curl/curl.h>
+#include <chrono>
+
+constexpr const char *WHEN_RUN = "before-roundof32";
+// constexpr const char *WHEN_RUN = "mid-roundof64";
+
+#define YEAR "2022"
+
+constexpr const char *PROBS_FNAME = YEAR "/fivethirtyeight_ncaa_forecasts.csv";
 
 constexpr size_t NUM_TEAMS = 64;
 constexpr size_t NUM_GAMES = NUM_TEAMS - 1;
+constexpr size_t NUM_ROUNDS = 6;
 
 using game_t = int_fast8_t;
 using team_t = int_fast8_t;
-
-#define YEAR "2022"
 
 using namespace std;
 
@@ -59,6 +91,148 @@ void assert_failed(const char *expr)
 }
 
 #define myassert(expr) ((expr) ? (void)0 : assert_failed(#expr))
+
+vector<string> split(string source, char delim)
+{
+   vector<string> result;
+   stringstream stream(source);
+   string item;
+   while (getline(stream, item, delim))
+   {
+      result.push_back(item);
+   }
+   return result;
+}
+
+/**********  Read CVS file  **********/
+
+vector<string> teams(NUM_TEAMS);
+unordered_map<int, team_t> eid_to_team;
+
+// vector<string> teams_normalized(NUM_TEAMS);
+
+/*
+void replace(string &original, const char *old_str, const char *new_str)
+{
+   size_t pos = original.find(old_str);
+   if (pos != string::npos)
+   {
+      original.replace(pos, strlen(old_str), new_str);
+   }
+}
+
+void normalize(string &team_name)
+{
+   for (auto &character : team_name)
+   {
+      character = tolower(character);
+   }
+
+   replace(team_name, "state", "st");
+   replace(team_name, " (ca)", "");
+   replace(team_name, "texas christian", "tcu");
+   replace(team_name, " (fl)", "");
+   replace(team_name, "j'ville", "jacksonville");
+   replace(team_name, "connecticut", "uconn");
+}
+*/
+
+struct CSVFile
+{
+   vector<string> headers;
+   vector<vector<string>> rows;
+
+   int column(const string &name)
+   {
+      return find(headers.begin(), headers.end(), name) - headers.begin();
+   }
+};
+
+CSVFile parse_csv(string fname)
+{
+   CSVFile result;
+   ifstream infile(fname);
+   string line;
+   // Read header.
+   getline(infile, line);
+   result.headers = split(line, ',');
+   while (getline(infile, line))
+   {
+      result.rows.push_back(split(line, ','));
+   }
+   return result;
+}
+
+vector<array<double, NUM_ROUNDS>> probs(NUM_TEAMS);
+
+void parse_probs(string fname)
+{
+   CSVFile csv = parse_csv(fname);
+
+   int gender = csv.column("gender");
+   int name = csv.column("team_name");
+   int id = csv.column("team_id");
+   int playin = csv.column("playin_flag");
+   int rd2 = csv.column("rd2_win");
+
+   for (auto &row : csv.rows)
+   {
+      if (row[gender] != "mens")
+      {
+         continue;
+      }
+
+      auto iter = eid_to_team.find(stoi(row[id]));
+
+      if (iter == eid_to_team.end())
+      {
+         // Let's ignore unrecognized teams from the first four.
+         if (row[playin] == "0")
+         {
+            cout << "Team " << row[name] << " eid " << row[id] << " from probability CSV not recognized.\n";
+            abort();
+         }
+         continue;
+      }
+
+      int team_id = iter->second;
+
+      array<double, NUM_ROUNDS> &this_probs = probs[team_id];
+      if (this_probs.empty())
+      {
+         double prev_prob;
+         for (size_t round = 0; round < NUM_ROUNDS; ++round)
+         {
+            double this_prob = stod(row[rd2 + round]);
+            if (round == 0 || this_prob == 0.0)
+            {
+               this_probs[round] = this_prob;
+            }
+            else
+            {
+               this_probs[round] = this_prob / prev_prob;
+            }
+
+            prev_prob = this_prob;
+         }
+      }
+   }
+}
+
+double get_prob(team_t team_index, int round)
+{
+   return probs[team_index][NUM_ROUNDS - 1 - round];
+}
+
+double game_prob(team_t first, team_t second, team_t winner, int round)
+{
+   myassert(winner >= 0);
+   myassert(first >= 0);
+   myassert(second >= 0);
+   myassert(winner == first || winner == second);
+
+   return get_prob(winner, round) / (get_prob(first, round) + get_prob(second, round));
+}
 
 /**********  Fetch a web page, extract & parse JSON  **********/
 
@@ -106,12 +280,22 @@ std::string get_url(const string &url)
    return stream.str();
 }
 
-std::string URL_FORMAT = "https://fantasy.espn.com/tournament-challenge-bracket/" YEAR
-                         "/en/entry?entryID={}";
+string get_with_caching(uint64_t entry)
+{
+   auto fpath = fmt::format(YEAR "/pages/{}-{}.html", entry, WHEN_RUN);
+   ifstream myfile(fpath);
+   stringstream stream;
+   stream << myfile.rdbuf();
+   return stream.str();
+}
+
+string URL_FORMAT = "https://fantasy.espn.com/tournament-challenge-bracket/" YEAR
+                    "/en/entry?entryID={}";
 
 string get_entry(uint64_t entry)
 {
-   return get_url(fmt::format(URL_FORMAT, entry));
+   return get_with_caching(entry);
+   // return get_url(fmt::format(URL_FORMAT, entry));
 }
 
 json get_json(const string &var, const string &source)
@@ -207,6 +391,27 @@ int winner(scoretuple_t scores)
    return index;
 }
 
+scoretuple_t normalize(scoretuple_t input)
+{
+   scoretuple_t result = input;
+   uint8_t *bytes = reinterpret_cast<uint8_t *>(&result);
+   uint8_t smallest = bytes[0];
+   for (size_t i = 1; i < NUM_BRACKETS; i++)
+   {
+      if (bytes[i] < smallest)
+      {
+         smallest = bytes[i];
+      }
+   }
+
+   for (size_t i = 0; i < NUM_BRACKETS; i++)
+   {
+      bytes[i] -= smallest;
+   }
+
+   return result;
+}
+
 string make_string(scoretuple_t scores)
 {
    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&scores);
@@ -233,8 +438,6 @@ struct Matchup
    team_t second_team = -1;
    team_t winner = -1;
 };
-
-vector<string> teams(NUM_TEAMS);
 
 string to_string(const Matchup &matchup)
 {
@@ -312,11 +515,9 @@ Bracket get_bracket(uint64_t entry)
    }
 
    auto picks_str = get_json("espn.fantasy.maxpart.config.pickString", html);
-   stringstream stream(picks_str.get<string>());
-   string item;
-   while (getline(stream, item, '|'))
+   for (auto &pick_str : split(picks_str.get<string>(), '|'))
    {
-      result.picks.push_back(stoi(item) - 1);
+      result.picks.push_back(stoi(pick_str) - 1);
    }
    myassert(result.picks.size() == NUM_GAMES);
 
@@ -336,7 +537,8 @@ void make_all_selections()
 
 /**********  Outcomes  **********/
 
-scoretuple_t get_scoretuple(game_t match_index, team_t winning_team, uint8_t reduced_points)
+scoretuple_t
+get_scoretuple(game_t match_index, team_t winning_team, uint8_t reduced_points)
 {
    scoretuple_t scores{0};
 
@@ -356,9 +558,9 @@ scoretuple_t get_scoretuple(game_t match_index, team_t winning_team, uint8_t red
 struct Outcomes
 {
    team_t team;
-   unordered_set<scoretuple_t> scores;
+   unordered_map<scoretuple_t, double> scores;
 
-   Outcomes(team_t team, scoretuple_t scores) : team(team), scores{scores} {}
+   Outcomes(team_t team, scoretuple_t scores, double prob) : team(team), scores{{scores, prob}} {}
    Outcomes() : team(-1) {}
    Outcomes(team_t team) : team(team) {}
 };
@@ -369,7 +571,7 @@ string to_string(const Outcomes &outcome)
    result += (outcome.team < 0 ? "other" : teams[outcome.team]) + ":";
    for (const auto scores : outcome.scores)
    {
-      result += " " + make_string(scores);
+      result += " " + make_string(scores.first) + " (" + to_string(scores.second) + ")";
    }
    return result + "\n";
 }
@@ -386,8 +588,15 @@ Outcomes *find_team(vector<Outcomes> &outcomes, team_t team)
    return nullptr;
 }
 
+struct TeamWithProb
+{
+   team_t team;
+   double prob;
+};
+
 // The first element of the vector is always for team "other".
-vector<Outcomes> outcomes(
+vector<Outcomes>
+outcomes(
     game_t match_index,
     bitset<64> selections)
 {
@@ -399,30 +608,31 @@ vector<Outcomes> outcomes(
       myassert(this_points == 10);
       vector<Outcomes> result(1);
       const Matchup &game = games[match_index];
-      vector<team_t> teams;
+      vector<TeamWithProb> teams_with_probs;
       if (game.winner >= 0)
       {
-         teams.push_back(game.winner);
+         teams_with_probs.push_back({game.winner, 1.0});
       }
       else
       {
          myassert(game.first_team >= 0);
          myassert(game.second_team >= 0);
-         teams.push_back(game.first_team);
-         teams.push_back(game.second_team);
+         double prob_first = game_prob(game.first_team, game.second_team, game.first_team, ri.round);
+         teams_with_probs.push_back({game.first_team, prob_first});
+         teams_with_probs.push_back({game.second_team, 1.0 - prob_first});
       }
 
-      for (team_t team : teams)
+      for (const TeamWithProb &team_with_prob : teams_with_probs)
       {
-         auto scores = get_scoretuple(match_index, team, this_points / 10);
-         myassert(team >= 0);
-         if (selections[team])
+         auto scores = get_scoretuple(match_index, team_with_prob.team, this_points / 10);
+         myassert(team_with_prob.team >= 0);
+         if (selections[team_with_prob.team])
          {
-            result.emplace_back(team, scores);
+            result.emplace_back(team_with_prob.team, scores, team_with_prob.prob);
          }
          else
          {
-            result[0].scores.insert(scores);
+            result[0].scores[scores] += team_with_prob.prob;
          }
       }
 
@@ -434,12 +644,41 @@ vector<Outcomes> outcomes(
    const auto outcomes1 = outcomes(prev_match, all_selections[match_index]);
    const auto outcomes2 = outcomes(prev_match + 1, all_selections[match_index]);
    vector<Outcomes> result(1);
-   cout << "About to loop, round " << ri.round << endl;
+   if (ri.round <= 1)
+   {
+      cout << "About to loop, round " << ri.round << endl;
+   }
 
    for (const auto &outcome1 : outcomes1)
    {
+      if (ri.round == 0)
+      {
+         cout << (outcome1.team < 0 ? "other" : teams[outcome1.team]) << endl;
+      }
       for (const auto &outcome2 : outcomes2)
       {
+         if (ri.round == 0)
+         {
+            cout << "    " << (outcome2.team < 0 ? "other" : teams[outcome2.team]) << endl;
+         }
+
+         // What do we do here if one team is "other"?  We could use the
+         // probability for just the known team.  After all, that's the
+         // probability of winning against a generic opponent.  However, that
+         // will probably overestimate the chance of winning.  Imagine team1
+         // (known) goes against two possible team 2s, a strong and a weak.  If
+         // every bracket chooses the strong player, then the weak is labelled
+         // "other", but the probability stored in the CSV will be a weighted
+         // average of the weak and strong.  And probably more heavily weighted
+         // for the strong, since it's more likely to get to that round.
+         //
+         // Another possibility is to not use "other" at all but keep all team
+         // names.  That could easily blow up time and memory requirements
+         // though.
+         double prob_first = game_prob(outcome1.team, outcome2.team, outcome1.team, ri.round);
+
+         // So if both are "other", do we even need to loop over two winners?
+         // Since the scores will be exactly the same either way?
          for (auto winner : {outcome1.team, outcome2.team})
          {
             // Find the destination spot in result
@@ -457,11 +696,13 @@ vector<Outcomes> outcomes(
                   dest = &result[result.size() - 1];
                }
             }
-            for (const scoretuple_t score1 : outcome1.scores)
+
+            size_t iters = 0;
+            for (const auto score_and_prob1 : outcome1.scores)
             {
-               for (const scoretuple_t score2 : outcome2.scores)
+               for (const auto score_and_prob2 : outcome2.scores)
                {
-                  scoretuple_t total_scores = score1 + score2;
+                  scoretuple_t total_scores = score_and_prob1.first + score_and_prob2.second;
                   scoretuple_t overall_scores;
                   if (winner < 0)
                   {
@@ -472,15 +713,29 @@ vector<Outcomes> outcomes(
                      auto this_scores = get_scoretuple(match_index, winner, this_points / 10);
                      overall_scores = total_scores + this_scores;
                   }
-                  dest->scores.insert(overall_scores);
+                  dest->scores[normalize(overall_scores)] += score_and_prob1.second * score_and_prob2.second;
+               }
+               iters++;
+               if (ri.round == 0 && iters % 100 == 0)
+               {
+                  cout << (iters / (double)outcome1.scores.size() * 100) << "%\n";
                }
             }
          }
       }
    }
 
-   cout << "loop done.\n";
+   if (ri.round <= 1)
+   {
+      cout << "loop done.\n";
+   }
    return result;
+}
+
+template <typename Clock>
+double elapsed(time_point<Clock> start, time_point<Clock> end)
+{
+   return duration_cast<microseconds>(end - start).count() / 1e6;
 }
 
 /**********  Putting it all together  **********/
@@ -492,7 +747,9 @@ int main(int argc, char *argv[])
    myassert(teams_json.size() == NUM_TEAMS);
    for (const auto &team : teams_json)
    {
-      teams[team["id"].get<int>() - 1] = team["n"];
+      int id = team["id"].get<int>() - 1;
+      teams[id] = team["n"];
+      eid_to_team[team["eid"].get<int>()] = id;
    }
 
    const auto matchups_json = get_json("espn.fantasy.maxpart.config.scoreboard_matchups", html);
@@ -514,6 +771,8 @@ int main(int argc, char *argv[])
    make_all_selections();
 
    myassert(all_selections.size() == NUM_GAMES);
+
+   parse_probs(PROBS_FNAME);
 
    {
       cout << "**********  2nd from the top Round of 32 game in the South\n";
@@ -575,9 +834,24 @@ int main(int argc, char *argv[])
       }
    }
 
+#ifdef FOO
    {
       cout << "**********  Whole Thing!\n";
+      auto start = high_resolution_clock::now();
       auto results = outcomes(62, {});
+      cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
+      myassert(results.size() == 1);
+      myassert(results[0].team == -1);
+      vector<size_t> count(NUM_BRACKETS);
+      for (const scoretuple_t score : results[0].scores)
+      {
+         count[winner(score)]++;
+      }
+      for (int i = 0; i < NUM_BRACKETS; ++i)
+      {
+         cout << brackets[i].name << ": " << count[i] << "\n";
+      }
+      /*
       for (const auto &outcome : results)
       {
          if (!outcome.scores.empty())
@@ -585,7 +859,9 @@ int main(int argc, char *argv[])
             cout << (outcome.team < 0 ? "other" : teams[outcome.team]) << ": " << outcome.scores.size() << "\n";
          }
       }
+      */
    }
+#endif
 
    return 0;
 }
