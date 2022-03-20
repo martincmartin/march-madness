@@ -51,8 +51,8 @@
 #include <curl/curl.h>
 #include <chrono>
 
-constexpr const char *WHEN_RUN = "before-roundof32";
-//  constexpr const char *WHEN_RUN = "mid-roundof64";
+// constexpr const char *WHEN_RUN = "mid-roundof32";
+constexpr const char *WHEN_RUN = "before-roundof64";
 
 #define YEAR "2022"
 
@@ -104,7 +104,79 @@ vector<string> split(string source, char delim)
    return result;
 }
 
-/**********  Read CVS file  **********/
+/**********  Fetch a URL, with caching.  **********/
+size_t write_callback(char *buffer, size_t size, size_t nmemb, void *user_data)
+{
+   stringstream &stream = *reinterpret_cast<stringstream *>(user_data);
+
+   stream.write((const char *)buffer, size * nmemb);
+
+   return size * nmemb;
+}
+
+std::string get_url(const string &url)
+{
+   CURL *curl = curl_easy_init();
+   if (!curl)
+   {
+      throw runtime_error("curl_easy_init() failed.");
+   }
+
+   cout << "Fetching URL." << endl;
+
+   stringstream stream;
+
+   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &stream);
+
+   CURLcode res = curl_easy_perform(curl);
+   if (res != CURLE_OK)
+   {
+      curl_easy_cleanup(curl);
+      throw runtime_error(curl_easy_strerror(res));
+   }
+
+   long http_code{0};
+   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+   if (http_code != 200)
+   {
+      curl_easy_cleanup(curl);
+      throw runtime_error("Didn't get 200.");
+   }
+
+   curl_easy_cleanup(curl);
+
+   return stream.str();
+}
+
+string get_with_caching(string url, string fpath)
+{
+   {
+      ifstream myinfile(fpath);
+      if (myinfile)
+      {
+         stringstream stream;
+         // TODO: How do I check for errors while reading?
+         stream << myinfile.rdbuf();
+         return stream.str();
+      }
+   }
+
+   string body = get_url(url);
+   ofstream myoutfile(fpath);
+   if (!myoutfile)
+   {
+      throw runtime_error("Error opening file to write " + fpath);
+   }
+
+   myoutfile << body;
+
+   return body;
+}
+
+/**********  Read forecasts from CSV file  **********/
 
 vector<string> teams(NUM_TEAMS);
 unordered_map<int, team_t> eid_to_team;
@@ -148,22 +220,25 @@ struct CSVFile
    }
 };
 
-CSVFile parse_csv(string fname)
+string get_forecasts()
+{
+   return get_with_caching("https://projects.fivethirtyeight.com/march-madness-api/2022/fivethirtyeight_ncaa_forecasts.csv",
+                           fmt::format(PROBS_FNAME, WHEN_RUN));
+}
+
+CSVFile parse_csv()
 {
    CSVFile result;
-   ifstream infile(fname);
-   if (!infile)
-   {
-      throw runtime_error("Failed to open " + fname);
-   }
+   stringstream mystream(get_forecasts());
+
    string line;
    // Read header.
-   if (!getline(infile, line))
+   if (!getline(mystream, line))
    {
-      throw runtime_error("Failed to read header from " + fname);
+      throw runtime_error("Failed to read header from forecasts CSV file.");
    }
    result.headers = split(line, ',');
-   while (getline(infile, line))
+   while (getline(mystream, line))
    {
       result.rows.push_back(split(line, ','));
    }
@@ -172,9 +247,9 @@ CSVFile parse_csv(string fname)
 
 vector<array<double, NUM_ROUNDS>> probs(NUM_TEAMS);
 
-void parse_probs(string fname)
+void parse_probs()
 {
-   CSVFile csv = parse_csv(fname);
+   CSVFile csv = parse_csv();
 
    int gender = csv.column("gender");
    int name = csv.column("team_name");
@@ -253,68 +328,16 @@ double game_prob(team_t first, team_t second, team_t winner, int round)
    return result;
 }
 
-/**********  Fetch a web page, extract & parse JSON  **********/
-
-size_t write_callback(char *buffer, size_t size, size_t nmemb, void *user_data)
-{
-   stringstream &stream = *reinterpret_cast<stringstream *>(user_data);
-
-   stream.write((const char *)buffer, size * nmemb);
-
-   return size * nmemb;
-}
-
-std::string get_url(const string &url)
-{
-   CURL *curl = curl_easy_init();
-   if (!curl)
-   {
-      throw runtime_error("curl_easy_init() failed.");
-   }
-
-   stringstream stream;
-
-   curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &stream);
-
-   CURLcode res = curl_easy_perform(curl);
-   if (res != CURLE_OK)
-   {
-      curl_easy_cleanup(curl);
-      throw runtime_error(curl_easy_strerror(res));
-   }
-
-   long http_code{0};
-   curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-   if (http_code != 200)
-   {
-      curl_easy_cleanup(curl);
-      throw runtime_error("Didn't get 200.");
-   }
-
-   curl_easy_cleanup(curl);
-
-   return stream.str();
-}
-
-string get_with_caching(uint64_t entry)
-{
-   auto fpath = fmt::format(YEAR "/pages/{}-{}.html", entry, WHEN_RUN);
-   ifstream myfile(fpath);
-   stringstream stream;
-   stream << myfile.rdbuf();
-   return stream.str();
-}
+/**********  Fetch a URL, extract & parse JSON  **********/
 
 string URL_FORMAT = "https://fantasy.espn.com/tournament-challenge-bracket/" YEAR
                     "/en/entry?entryID={}";
 
 string get_entry(uint64_t entry)
 {
-   return get_with_caching(entry);
-   // return get_url(fmt::format(URL_FORMAT, entry));
+   return get_with_caching(
+       fmt::format(URL_FORMAT, entry),
+       fmt::format(YEAR "/pages/{}-{}.html", entry, WHEN_RUN));
 }
 
 json get_json(const string &var, const string &source)
@@ -619,6 +642,7 @@ outcomes(
     game_t match_index,
     bitset<64> selections)
 {
+   const Matchup &game = games[match_index];
    const auto ri = round_index(match_index + 1);
    int this_points = points_per_match[match_index];
    if (ri.round == 5)
@@ -626,7 +650,6 @@ outcomes(
       // Base case, round of 64.
       myassert(this_points == 10);
       vector<Outcomes> result(1);
-      const Matchup &game = games[match_index];
       vector<TeamWithProb> teams_with_probs;
       if (game.winner >= 0)
       {
@@ -697,13 +720,27 @@ outcomes(
          }
          */
 
-         Check here to see if game has already been played IRL and we should just take the winner.;
-
-         double prob_first = game_prob(outcome1.team, outcome2.team, outcome1.team, ri.round);
+         vector<TeamWithProb> teams_with_probs;
+         if (game.winner >= 0)
+         {
+            // If this game has been played in real life, then all previous games
+            // have also been played, so our recursive outcomes had better have
+            // only a single non-empty result.
+            myassert(outcomes1.size() == 1 || (outcomes1.size() == 2 && outcomes1[0].scores.empty()));
+            myassert(outcomes2.size() == 1 || (outcomes2.size() == 2 && outcomes2[0].scores.empty()));
+            myassert(game.winner == outcome1.team || game.winner == outcome2.team);
+            teams_with_probs.push_back({game.winner, 1.0});
+         }
+         else
+         {
+            double prob_first = game_prob(outcome1.team, outcome2.team, outcome1.team, ri.round);
+            teams_with_probs.push_back({outcome1.team, prob_first});
+            teams_with_probs.push_back({outcome2.team, 1.0 - prob_first});
+         }
 
          // So if both are "other", do we even need to loop over two winners?
          // Since the scores will be exactly the same either way?
-         for (const auto &winner : {TeamWithProb{outcome1.team, prob_first}, TeamWithProb{outcome2.team, 1 - prob_first}})
+         for (const auto &winner : teams_with_probs)
          {
             myassert(winner.team >= 0);
             // Find the destination spot in result
@@ -791,7 +828,7 @@ int main(int argc, char *argv[])
 
    myassert(all_selections.size() == NUM_GAMES);
 
-   parse_probs(fmt::format(PROBS_FNAME, WHEN_RUN));
+   parse_probs();
 
    {
       cout << "**********  2nd from the top Round of 32 game in the South\n";
@@ -864,18 +901,26 @@ int main(int argc, char *argv[])
       auto start = high_resolution_clock::now();
       auto results = outcomes(62, {});
       cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
-      vector<double> win_probs(NUM_BRACKETS);
+      vector<pair<int, double>> win_probs(NUM_BRACKETS);
+      for (size_t i = 0; i < NUM_BRACKETS; ++i)
+      {
+         win_probs[i].first = i;
+      }
+
       for (const Outcomes &outc : results)
       {
          for (const auto &score_and_prob : outc.scores)
          {
-            win_probs[winner(score_and_prob.first)] += score_and_prob.second;
+            win_probs[winner(score_and_prob.first)].second += score_and_prob.second;
          }
       }
+
       cout << "***** Probability of Win for each Bracket *****\n";
+      sort(win_probs.begin(), win_probs.end(), [](auto &a, auto &b)
+           { return a.second > b.second; });
       for (int i = 0; i < NUM_BRACKETS; ++i)
       {
-         cout << fmt::format("{:<22}: {:5.2f}%\n", brackets[i].name, win_probs[i] * 100);
+         cout << fmt::format("{:<22}: {:5.2f}%\n", brackets[win_probs[i].first].name, win_probs[i].second * 100);
       }
    }
 
