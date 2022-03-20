@@ -51,12 +51,13 @@
 #include <curl/curl.h>
 #include <chrono>
 
-constexpr const char *WHEN_RUN = "before-roundof32";
-// constexpr const char *WHEN_RUN = "mid-roundof64";
+constexpr const char *WHEN_RUN = "before-roundof64";
+// constexpr const char *WHEN_RUN = "before-roundof32";
+//  constexpr const char *WHEN_RUN = "mid-roundof64";
 
 #define YEAR "2022"
 
-constexpr const char *PROBS_FNAME = YEAR "/fivethirtyeight_ncaa_forecasts.csv";
+constexpr const char *PROBS_FNAME = YEAR "/{}-fivethirtyeight_ncaa_forecasts.csv";
 
 constexpr size_t NUM_TEAMS = 64;
 constexpr size_t NUM_GAMES = NUM_TEAMS - 1;
@@ -175,6 +176,8 @@ void parse_probs(string fname)
    int playin = csv.column("playin_flag");
    int rd2 = csv.column("rd2_win");
 
+   vector<bool> seen(NUM_TEAMS);
+
    for (auto &row : csv.rows)
    {
       if (row[gender] != "mens")
@@ -198,8 +201,9 @@ void parse_probs(string fname)
       int team_id = iter->second;
 
       array<double, NUM_ROUNDS> &this_probs = probs[team_id];
-      if (this_probs.empty())
+      if (!seen[team_id])
       {
+         seen[team_id] = true;
          double prev_prob;
          for (size_t round = 0; round < NUM_ROUNDS; ++round)
          {
@@ -626,7 +630,8 @@ outcomes(
       {
          auto scores = get_scoretuple(match_index, team_with_prob.team, this_points / 10);
          myassert(team_with_prob.team >= 0);
-         if (selections[team_with_prob.team])
+
+         if (true /* selections[team_with_prob.team] */)
          {
             result.emplace_back(team_with_prob.team, scores, team_with_prob.prob);
          }
@@ -651,12 +656,23 @@ outcomes(
 
    for (const auto &outcome1 : outcomes1)
    {
+      if (outcome1.scores.empty())
+      {
+         continue;
+      }
+      myassert(outcome1.team >= 0);
       if (ri.round == 0)
       {
          cout << (outcome1.team < 0 ? "other" : teams[outcome1.team]) << endl;
       }
       for (const auto &outcome2 : outcomes2)
       {
+         if (outcome2.scores.empty())
+         {
+            continue;
+         }
+         myassert(outcome2.team >= 0);
+
          if (ri.round == 0)
          {
             cout << "    " << (outcome2.team < 0 ? "other" : teams[outcome2.team]) << endl;
@@ -679,20 +695,21 @@ outcomes(
 
          // So if both are "other", do we even need to loop over two winners?
          // Since the scores will be exactly the same either way?
-         for (auto winner : {outcome1.team, outcome2.team})
+         for (const auto &winner : {TeamWithProb{outcome1.team, prob_first}, TeamWithProb{outcome2.team, 1 - prob_first}})
          {
+            myassert(winner.team >= 0);
             // Find the destination spot in result
             Outcomes *dest;
-            if (winner < 0 || !selections[winner])
+            if (false /* winner < 0 || !selections[winner] */)
             {
                dest = &result[0];
             }
             else
             {
-               dest = find_team(result, winner);
+               dest = find_team(result, winner.team);
                if (!dest)
                {
-                  result.emplace_back(winner);
+                  result.emplace_back(winner.team);
                   dest = &result[result.size() - 1];
                }
             }
@@ -702,18 +719,18 @@ outcomes(
             {
                for (const auto score_and_prob2 : outcome2.scores)
                {
-                  scoretuple_t total_scores = score_and_prob1.first + score_and_prob2.second;
+                  scoretuple_t total_scores = score_and_prob1.first + score_and_prob2.first;
                   scoretuple_t overall_scores;
-                  if (winner < 0)
+                  if (winner.team < 0)
                   {
                      overall_scores = total_scores;
                   }
                   else
                   {
-                     auto this_scores = get_scoretuple(match_index, winner, this_points / 10);
+                     auto this_scores = get_scoretuple(match_index, winner.team, this_points / 10);
                      overall_scores = total_scores + this_scores;
                   }
-                  dest->scores[normalize(overall_scores)] += score_and_prob1.second * score_and_prob2.second;
+                  dest->scores[normalize(overall_scores)] += winner.prob * score_and_prob1.second * score_and_prob2.second;
                }
                iters++;
                if (ri.round == 0 && iters % 100 == 0)
@@ -772,7 +789,7 @@ int main(int argc, char *argv[])
 
    myassert(all_selections.size() == NUM_GAMES);
 
-   parse_probs(PROBS_FNAME);
+   parse_probs(fmt::format(PROBS_FNAME, WHEN_RUN));
 
    {
       cout << "**********  2nd from the top Round of 32 game in the South\n";
@@ -784,6 +801,12 @@ int main(int argc, char *argv[])
             cout << to_string(outcome);
          }
       }
+      /* Correct results for before-roundof64:
+      Houston: (30, 30, 10, 10, 30, 10, 0, 30) (0.104051) (40, 40, 20, 20, 40, 0, 10, 40) (0.332539)
+      Illinois: (0, 0, 20, 20, 0, 0, 10, 0) (0.109205) (20, 20, 40, 40, 20, 0, 10, 20) (0.286999)
+      Chattanooga: (0, 0, 0, 0, 0, 40, 10, 0) (0.018375) (10, 10, 10, 10, 10, 30, 0, 10) (0.044459)
+      UAB: (0, 0, 0, 0, 0, 20, 30, 0) (0.026475) (0, 0, 0, 0, 0, 0, 30, 0) (0.077896)
+      */
    }
 
    {
@@ -821,6 +844,8 @@ int main(int argc, char *argv[])
          }
       }
    }
+
+   return 0;
 
    {
       cout << "**********  Midwest & South\n";
