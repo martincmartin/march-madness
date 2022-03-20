@@ -872,19 +872,11 @@ int main(int argc, char *argv[])
             win_probs[winner(score_and_prob.first)] += score_and_prob.second;
          }
       }
+      cout << "***** Probability of Win for each Bracket *****\n";
       for (int i = 0; i < NUM_BRACKETS; ++i)
       {
-         cout << brackets[i].name << ": " << win_probs[i] << "\n";
+         cout << fmt::format("{:<22}: {:5.2f}%\n", brackets[i].name, win_probs[i] * 100);
       }
-      /*
-      for (const auto &outcome : results)
-      {
-         if (!outcome.scores.empty())
-         {
-            cout << (outcome.team < 0 ? "other" : teams[outcome.team]) << ": " << outcome.scores.size() << "\n";
-         }
-      }
-      */
    }
 
    return 0;
