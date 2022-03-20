@@ -51,8 +51,7 @@
 #include <curl/curl.h>
 #include <chrono>
 
-constexpr const char *WHEN_RUN = "before-roundof64";
-// constexpr const char *WHEN_RUN = "before-roundof32";
+constexpr const char *WHEN_RUN = "before-roundof32";
 //  constexpr const char *WHEN_RUN = "mid-roundof64";
 
 #define YEAR "2022"
@@ -153,9 +152,16 @@ CSVFile parse_csv(string fname)
 {
    CSVFile result;
    ifstream infile(fname);
+   if (!infile)
+   {
+      throw runtime_error("Failed to open " + fname);
+   }
    string line;
    // Read header.
-   getline(infile, line);
+   if (!getline(infile, line))
+   {
+      throw runtime_error("Failed to read header from " + fname);
+   }
    result.headers = split(line, ',');
    while (getline(infile, line))
    {
@@ -235,7 +241,16 @@ double game_prob(team_t first, team_t second, team_t winner, int round)
    myassert(second >= 0);
    myassert(winner == first || winner == second);
 
-   return get_prob(winner, round) / (get_prob(first, round) + get_prob(second, round));
+   double result = get_prob(winner, round) / (get_prob(first, round) + get_prob(second, round));
+   if (isnan(result))
+   {
+      cout << "first: " << first << ", second: " << second << ", winner: " << winner << ", round: " << round << endl;
+      cout << get_prob(winner, round) << endl;
+      cout << get_prob(first, round) << endl;
+      cout << get_prob(second, round) << endl;
+   }
+   myassert(!isnan(result));
+   return result;
 }
 
 /**********  Fetch a web page, extract & parse JSON  **********/
@@ -661,10 +676,12 @@ outcomes(
          continue;
       }
       myassert(outcome1.team >= 0);
+      /*
       if (ri.round == 0)
       {
          cout << (outcome1.team < 0 ? "other" : teams[outcome1.team]) << endl;
       }
+      */
       for (const auto &outcome2 : outcomes2)
       {
          if (outcome2.scores.empty())
@@ -673,24 +690,15 @@ outcomes(
          }
          myassert(outcome2.team >= 0);
 
+         /*
          if (ri.round == 0)
          {
             cout << "    " << (outcome2.team < 0 ? "other" : teams[outcome2.team]) << endl;
          }
+         */
 
-         // What do we do here if one team is "other"?  We could use the
-         // probability for just the known team.  After all, that's the
-         // probability of winning against a generic opponent.  However, that
-         // will probably overestimate the chance of winning.  Imagine team1
-         // (known) goes against two possible team 2s, a strong and a weak.  If
-         // every bracket chooses the strong player, then the weak is labelled
-         // "other", but the probability stored in the CSV will be a weighted
-         // average of the weak and strong.  And probably more heavily weighted
-         // for the strong, since it's more likely to get to that round.
-         //
-         // Another possibility is to not use "other" at all but keep all team
-         // names.  That could easily blow up time and memory requirements
-         // though.
+         Check here to see if game has already been played IRL and we should just take the winner.;
+
          double prob_first = game_prob(outcome1.team, outcome2.team, outcome1.team, ri.round);
 
          // So if both are "other", do we even need to loop over two winners?
@@ -714,7 +722,6 @@ outcomes(
                }
             }
 
-            size_t iters = 0;
             for (const auto score_and_prob1 : outcome1.scores)
             {
                for (const auto score_and_prob2 : outcome2.scores)
@@ -731,11 +738,6 @@ outcomes(
                      overall_scores = total_scores + this_scores;
                   }
                   dest->scores[normalize(overall_scores)] += winner.prob * score_and_prob1.second * score_and_prob2.second;
-               }
-               iters++;
-               if (ri.round == 0 && iters % 100 == 0)
-               {
-                  cout << (iters / (double)outcome1.scores.size() * 100) << "%\n";
                }
             }
          }
@@ -845,8 +847,6 @@ int main(int argc, char *argv[])
       }
    }
 
-   return 0;
-
    {
       cout << "**********  Midwest & South\n";
       auto midwest_south = outcomes(61, all_selections[62]);
@@ -859,22 +859,22 @@ int main(int argc, char *argv[])
       }
    }
 
-#ifdef FOO
    {
       cout << "**********  Whole Thing!\n";
       auto start = high_resolution_clock::now();
       auto results = outcomes(62, {});
       cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
-      myassert(results.size() == 1);
-      myassert(results[0].team == -1);
-      vector<size_t> count(NUM_BRACKETS);
-      for (const scoretuple_t score : results[0].scores)
+      vector<double> win_probs(NUM_BRACKETS);
+      for (const Outcomes &outc : results)
       {
-         count[winner(score)]++;
+         for (const auto &score_and_prob : outc.scores)
+         {
+            win_probs[winner(score_and_prob.first)] += score_and_prob.second;
+         }
       }
       for (int i = 0; i < NUM_BRACKETS; ++i)
       {
-         cout << brackets[i].name << ": " << count[i] << "\n";
+         cout << brackets[i].name << ": " << win_probs[i] << "\n";
       }
       /*
       for (const auto &outcome : results)
@@ -886,7 +886,6 @@ int main(int argc, char *argv[])
       }
       */
    }
-#endif
 
    return 0;
 }
