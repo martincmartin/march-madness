@@ -12,30 +12,19 @@
 // NOTE: Match, matchup and game are used interchangeably in this code.  Should
 // probably standardize on match.  Oh well.
 
-// This code runs in reasonable time & RAM after round of 64 / before round of
-// 32.  However, mid round of 64, it's taking over 30 min on my Macbook Air (M1)
-// and using more than 7 of my 8 GB.  Only 6 min was user, 24 min was system.
-// So still not practical.  Could try it on my desktop.  Could always do Monte
-//      Carlo, or trim unlikley outcomes I suppose.  Actually, could do Monte
-//      Carlo just for round 0!  That would solve all possibilities.
+// This code runs in reasonable time & RAM after round of 64 / before
+// round-of-32.  However, mid round of 64, it's taking 15.6 GB on Ubuntu and
+// swapping, and 21 minutes, and is killed just before finishing. And that's the
+// version that only computes score tuples, not probabilities.  So still not
+// practical.  Could always do Monte Carlo, or trim unlikley outcomes I suppose.
+// Actually, could do Monte Carlo just for round 0!  That would solve all
+// possibilities.
 
-// I think we should get our probabilities from 538.  They update them all the
+// I think we should get our forecast from 538.  They update them all the
 // time, so e.g. after round of 64 I can get fresh probabilities.  Ken Pomeroy
 // sometimes updates his, but sometimes doesn't, even after first four.  Plus I
 // don't think he ever updates them between rounds of 64 and 32.  URL:
 // https://projects.fivethirtyeight.com/march-madness-api/2022/fivethirtyeight_ncaa_forecasts.csv
-//
-// There doesn't seem to be a standard CSV parsing library in C++.  The answer
-// seems to be, just use ifstream and getline(), i.e. ignore quotes and
-// escaping.  If you need something better, consider rapidcsv from here:
-// https://github.com/d99kris/rapidcsv
-//
-// The "rd?_win" columns seem to be the probability of winning that round.  rd1
-// is the "First Four", where we narrow from 68 to 64.  rd2 is the Round of 64,
-// rd3 is Round of 32.  Just keep the first one you see, i.e. assume the most
-// recent entries are on top.
-//
-// What a pain in the ass to parse all this.
 
 #include <cstdlib>
 #include <vector>
@@ -51,8 +40,8 @@
 #include <curl/curl.h>
 #include <chrono>
 
-// constexpr const char *WHEN_RUN = "mid-roundof32";
-constexpr const char *WHEN_RUN = "before-roundof64";
+// constexpr const char *WHEN_RUN = "mid2-roundof32";
+constexpr const char *WHEN_RUN = "before-sweet16";
 
 #define YEAR "2022"
 
@@ -122,7 +111,7 @@ std::string get_url(const string &url)
       throw runtime_error("curl_easy_init() failed.");
    }
 
-   cout << "Fetching URL." << endl;
+   cout << "Fetching " << url << endl;
 
    stringstream stream;
 
@@ -177,6 +166,18 @@ string get_with_caching(string url, string fpath)
 }
 
 /**********  Read forecasts from CSV file  **********/
+
+// There doesn't seem to be a standard CSV parsing library in C++.  The answer
+// seems to be, just use ifstream and getline(), i.e. ignore quotes and
+// escaping.  If you need something better, consider rapidcsv from here:
+// https://github.com/d99kris/rapidcsv
+//
+// The "rd?_win" columns seem to be the probability of winning that round.  rd1
+// is the "First Four", where we narrow from 68 to 64.  rd2 is the Round of 64,
+// rd3 is Round of 32.  Just keep the first one you see, i.e. assume the most
+// recent entries are on top.
+//
+// What a pain in the ass to parse all this.
 
 vector<string> teams(NUM_TEAMS);
 unordered_map<int, team_t> eid_to_team;
@@ -328,7 +329,7 @@ double game_prob(team_t first, team_t second, team_t winner, int round)
    return result;
 }
 
-/**********  Fetch a URL, extract & parse JSON  **********/
+/**********  Fetch a bracket, extract & parse JSON  **********/
 
 string URL_FORMAT = "https://fantasy.espn.com/tournament-challenge-bracket/" YEAR
                     "/en/entry?entryID={}";
@@ -576,6 +577,68 @@ void make_all_selections()
       }
    }
 }
+
+/**********  Boolean Expressions, for "paths of glory"  **********/
+
+class BoolExpr
+{
+public:
+   virtual ~BoolExpr() {}
+};
+
+struct Var : public BoolExpr
+{
+   string name;
+   size_t index;
+   bool first;
+
+   static vector<pair<shared_ptr<Var>, shared_ptr<Var>>> all_vars;
+};
+
+vector<pair<shared_ptr<Var>, shared_ptr<Var>>> Var::all_vars(NUM_TEAMS);
+
+class OrExpr : public BoolExpr
+{
+public:
+   unordered_set<shared_ptr<BoolExpr>> children;
+
+   void add(shared_ptr<BoolExpr> child)
+   {
+      if (children.find(child) != children.end())
+      {
+         return;
+      }
+      if (auto var = reinterpret_cast<Var *>(child.get()))
+      {
+         // Find it's negated twin.
+         auto &temp = Var::all_vars[var->index];
+         myassert((var->first ? temp.first : temp.second).get() == var);
+         shared_ptr<Var> &twin = var->first ? temp.second : temp.first;
+         if (children.find(twin) != children.end())
+         {
+            // We have "P or not P", which is always true, so replace ourself
+            // with "true", which is just OrExpr of the empty set.
+            children.clear();
+            // If parent is AndExpr, we should get rid of this node entirely.  Hmm.
+            return;
+         }
+      }
+      children.insert(child);
+      // If child is AndExpr, and has a var (or subexression?) in common with
+      // existing child, factor them out: PQ \/ PR = P(Q \/ R)
+   }
+};
+
+class AndExpr : public BoolExpr
+{
+public:
+   unordered_set<shared_ptr<BoolExpr>> children;
+
+   void add(shared_ptr<BoolExpr> child)
+   {
+      children.insert(child);
+   }
+};
 
 /**********  Outcomes  **********/
 
