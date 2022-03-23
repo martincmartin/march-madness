@@ -626,7 +626,20 @@ struct Var : public BoolExpr
       return name;
    }
 
-   static vector<pair<shared_ptr<Var>, shared_ptr<Var>>> all_vars;
+   const shared_ptr<Var> &other() const
+   {
+      if (first)
+      {
+         return all_vars[index].second;
+      }
+      else
+      {
+         return all_vars[index].first;
+      }
+   }
+
+   static vector<pair<shared_ptr<Var>, shared_ptr<Var>>>
+       all_vars;
 };
 
 vector<pair<shared_ptr<Var>, shared_ptr<Var>>> Var::all_vars(NUM_TEAMS);
@@ -776,13 +789,24 @@ FactorResults factor_helper(
 // (A1 inner A2 inner B1 inner B2) outer (A1 inner A2 inner C1 inner C2) =>
 //     A1 inner A2 inner ((B1 inner B2) outer (C1 inner C2))
 
-template <typename ExprT>
+template <typename ExprT, typename OtherExprT>
 shared_ptr<BoolExpr> make_helper(unordered_set<shared_ptr<BoolExpr>> children)
 {
    myassert(!children.empty());
    if (children.size() == 1)
    {
       return *children.begin();
+   }
+
+   for (const auto &child : children)
+   {
+      if (auto child_var = dynamic_cast<Var *>(child.get()))
+      {
+         if (children.find(child_var->other()) != children.end())
+         {
+            return make_shared<OtherExprT>(unordered_set<shared_ptr<BoolExpr>>{});
+         }
+      }
    }
 
    return make_shared<ExprT>(std::move(children));
@@ -808,12 +832,12 @@ shared_ptr<BoolExpr> factor(const shared_ptr<BoolExpr> &first_in, const shared_p
 
    if (factored.reduced_first.empty() || factored.reduced_second.empty())
    {
-      return make_helper<InnerExprT>(std::move(factored.common));
+      return make_helper<InnerExprT, OuterExprT>(std::move(factored.common));
    }
 
    auto temp =
-       make_helper<OuterExprT>({make_helper<InnerExprT>(std::move(factored.reduced_first)),
-                                make_helper<InnerExprT>(std::move(factored.reduced_second))});
+       make_helper<OuterExprT, InnerExprT>({make_helper<InnerExprT, OuterExprT>(std::move(factored.reduced_first)),
+                                            make_helper<InnerExprT, OuterExprT>(std::move(factored.reduced_second))});
 
    factored.common.insert(std::move(temp));
    return make_shared<InnerExprT>(std::move(factored.common));
@@ -833,6 +857,14 @@ shared_ptr<BoolExpr> or_(unordered_set<shared_ptr<BoolExpr>> children)
    const shared_ptr<BoolExpr> &first = *iter;
    ++iter;
    const shared_ptr<BoolExpr> &second = *iter;
+
+   if (auto first_var = dynamic_cast<Var *>(first.get()))
+   {
+      if (first_var->other().get() == second.get())
+      {
+         return make_shared<OrExpr>(unordered_set<shared_ptr<BoolExpr>>());
+      }
+   }
 
    return factor<AndExpr, OrExpr>(first, second);
 }
@@ -1198,16 +1230,43 @@ int main(int argc, char *argv[])
    }
 
    {
-      cout << "**********  West & East\n";
+      cout << "**********  Elite 8 in the South\n";
+      // matches: 16, 17, 18, 19, 20, 21, 22, 23, 40, 41, 42, 43, 52, 53, 58
+      auto result = outcomes(58, all_selections[58]);
+      for (const auto &outcome : result)
+      {
+         if (!outcome.result_sets.empty())
+         {
+            cout << to_string(outcome);
+         }
+      }
+   }
+
+   {
+      cout << "**********  Elite 8 in the West\n";
+      auto result = outcomes(56, all_selections[56]);
+      for (const auto &outcome : result)
+      {
+         if (!outcome.result_sets.empty())
+         {
+            cout << to_string(outcome);
+         }
+      }
+   }
+
+   {
+      cout << "**********  Final 4 West & East\n";
       auto west_east = outcomes(60, all_selections[62]);
       for (const auto &outcome : west_east)
       {
          if (!outcome.result_sets.empty())
          {
-            cout << (outcome.team < 0 ? "other" : teams[outcome.team].name) << ": " << outcome.result_sets.size() << "\n";
+            cout << to_string(outcome);
          }
       }
    }
+
+   return 0;
 
    {
       cout << "**********  Midwest & South\n";
