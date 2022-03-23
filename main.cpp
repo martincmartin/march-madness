@@ -789,7 +789,42 @@ FactorResults factor_helper(
 // (A1 inner A2 inner B1 inner B2) outer (A1 inner A2 inner C1 inner C2) =>
 //     A1 inner A2 inner ((B1 inner B2) outer (C1 inner C2))
 
-template <typename ExprT, typename OtherExprT>
+template <typename ExprT>
+struct Other;
+
+template <>
+struct Other<AndExpr>
+{
+   using type = OrExpr;
+};
+
+template <>
+struct Other<OrExpr>
+{
+   using type = AndExpr;
+};
+
+template <typename ExprT>
+unordered_set<shared_ptr<BoolExpr>> flatten(unordered_set<shared_ptr<BoolExpr>> children)
+{
+   unordered_set<shared_ptr<BoolExpr>> new_kids; // on the block.
+
+   for (const auto &child : children)
+   {
+      if (auto target_expr = dynamic_cast<ExprT *>(child.get()))
+      {
+         new_kids.insert(target_expr->children.begin(), target_expr->children.end());
+      }
+      else
+      {
+         new_kids.insert(child);
+      }
+   }
+
+   return new_kids;
+}
+
+template <typename ExprT>
 shared_ptr<BoolExpr> make_helper(unordered_set<shared_ptr<BoolExpr>> children)
 {
    myassert(!children.empty());
@@ -798,18 +833,25 @@ shared_ptr<BoolExpr> make_helper(unordered_set<shared_ptr<BoolExpr>> children)
       return *children.begin();
    }
 
-   for (const auto &child : children)
+   auto new_kids = flatten<ExprT>(children);
+
+   for (const auto &child : new_kids)
    {
       if (auto child_var = dynamic_cast<Var *>(child.get()))
       {
-         if (children.find(child_var->other()) != children.end())
+         if (new_kids.find(child_var->other()) != new_kids.end())
          {
-            return make_shared<OtherExprT>(unordered_set<shared_ptr<BoolExpr>>{});
+            return make_shared<typename Other<ExprT>::type>(unordered_set<shared_ptr<BoolExpr>>{});
          }
       }
    }
 
-   return make_shared<ExprT>(std::move(children));
+   if (children.size() == 1)
+   {
+      return *children.begin();
+   }
+
+   return make_shared<ExprT>(std::move(new_kids));
 }
 
 template <typename InnerExprT, typename OuterExprT>
@@ -827,20 +869,20 @@ shared_ptr<BoolExpr> factor(const shared_ptr<BoolExpr> &first_in, const shared_p
 
    if (factored.common.empty())
    {
-      return make_shared<OuterExprT>(unordered_set<shared_ptr<BoolExpr>>{first_in, second_in});
+      return make_helper<OuterExprT>(unordered_set<shared_ptr<BoolExpr>>{first_in, second_in});
    }
 
    if (factored.reduced_first.empty() || factored.reduced_second.empty())
    {
-      return make_helper<InnerExprT, OuterExprT>(std::move(factored.common));
+      return make_helper<InnerExprT>(std::move(factored.common));
    }
 
    auto temp =
-       make_helper<OuterExprT, InnerExprT>({make_helper<InnerExprT, OuterExprT>(std::move(factored.reduced_first)),
-                                            make_helper<InnerExprT, OuterExprT>(std::move(factored.reduced_second))});
+       make_helper<OuterExprT>({make_helper<InnerExprT>(std::move(factored.reduced_first)),
+                                make_helper<InnerExprT>(std::move(factored.reduced_second))});
 
    factored.common.insert(std::move(temp));
-   return make_shared<InnerExprT>(std::move(factored.common));
+   return make_helper<InnerExprT>(std::move(factored.common));
 }
 
 shared_ptr<BoolExpr> or_(unordered_set<shared_ptr<BoolExpr>> children)
@@ -873,21 +915,7 @@ shared_ptr<AndExpr> and_(unordered_set<shared_ptr<BoolExpr>> children)
 {
    remove_empty(children);
 
-   unordered_set<shared_ptr<BoolExpr>> new_kids; // on the block.
-
-   for (const auto &child : children)
-   {
-      if (auto and_expr = dynamic_cast<AndExpr *>(child.get()))
-      {
-         new_kids.insert(and_expr->children.begin(), and_expr->children.end());
-      }
-      else
-      {
-         new_kids.insert(child);
-      }
-   }
-
-   return make_shared<AndExpr>(new_kids);
+   return make_shared<AndExpr>(flatten<AndExpr>(children));
 }
 
 /**********  Outcomes  **********/
@@ -943,7 +971,7 @@ string to_string(const Outcomes &outcome)
    result += (outcome.team < 0 ? "other" : teams[outcome.team].name) + ":\n";
    for (const auto &scores : outcome.result_sets)
    {
-      result += "    " + make_string(scores.first) + " (" + to_string(scores.second) + ")\n";
+      result += "    " + make_string(scores.first) + " " + to_string(scores.second) + "\n";
    }
    return result;
 }
