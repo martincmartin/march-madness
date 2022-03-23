@@ -179,7 +179,13 @@ string get_with_caching(string url, string fpath)
 //
 // What a pain in the ass to parse all this.
 
-vector<string> teams(NUM_TEAMS);
+struct Team
+{
+   string name;
+   string abbrev;
+};
+
+vector<Team> teams(NUM_TEAMS);
 unordered_map<int, team_t> eid_to_team;
 
 // vector<string> teams_normalized(NUM_TEAMS);
@@ -410,6 +416,15 @@ array<int, NUM_GAMES> points_per_match{
     // Championship
     320};
 
+const array<const string, NUM_ROUNDS> round_names{
+    "Champ",
+    "Final4",
+    "Elite8",
+    "Sweet16",
+    "Roundof32",
+    "Roundof64",
+};
+
 /**********  Tuples of scores, packed in an int  **********/
 
 // This should probably be a simple class, rather than a typedef.  Oh well.
@@ -485,8 +500,8 @@ struct Matchup
 string to_string(const Matchup &matchup)
 {
    return to_string(matchup.id) + ": " +
-          teams[matchup.first_team] + ", " + teams[matchup.second_team] + ", " +
-          (matchup.winner >= 0 ? teams[matchup.winner] : "None");
+          teams[matchup.first_team].name + ", " + teams[matchup.second_team].name + ", " +
+          (matchup.winner >= 0 ? teams[matchup.winner].name : "None");
 }
 
 Matchup parse_matchup(const json &matchup)
@@ -497,12 +512,12 @@ Matchup parse_matchup(const json &matchup)
    if (match_teams.size() >= 1)
    {
       result.first_team = match_teams[0]["id"].get<int>() - 65;
-      myassert(teams[result.first_team] == match_teams[0]["n"]);
+      myassert(teams[result.first_team].name == match_teams[0]["n"]);
    }
    if (match_teams.size() >= 2)
    {
       result.second_team = match_teams[1]["id"].get<int>() - 65;
-      myassert(teams[result.second_team] == match_teams[1]["n"]);
+      myassert(teams[result.second_team].name == match_teams[1]["n"]);
    }
    if (matchup.find("w") != matchup.end())
    {
@@ -535,7 +550,7 @@ string to_string(const bitset<NUM_TEAMS> selections)
          {
             result += ", ";
          }
-         result += teams[i];
+         result += teams[i].name;
          first = false;
       }
    }
@@ -584,61 +599,264 @@ class BoolExpr
 {
 public:
    virtual ~BoolExpr() {}
+
+   virtual string to_string() const = 0;
 };
+
+string to_string(const shared_ptr<BoolExpr> &ptr)
+{
+   if (ptr)
+   {
+      return ptr->to_string();
+   }
+
+   return "empty";
+}
 
 struct Var : public BoolExpr
 {
-   string name;
-   size_t index;
-   bool first;
+   const string name;
+   const size_t index;
+   const bool first;
+
+   Var(string name, size_t index, bool first) : name(name), index(index), first(first) {}
+
+   string to_string() const
+   {
+      return name;
+   }
 
    static vector<pair<shared_ptr<Var>, shared_ptr<Var>>> all_vars;
 };
 
 vector<pair<shared_ptr<Var>, shared_ptr<Var>>> Var::all_vars(NUM_TEAMS);
 
-class OrExpr : public BoolExpr
+class InfixExpr : public BoolExpr
 {
 public:
-   unordered_set<shared_ptr<BoolExpr>> children;
+   // I wonder if this should be a vector, since that would be more readable.
+   const unordered_set<shared_ptr<BoolExpr>> children;
 
-   void add(shared_ptr<BoolExpr> child)
+   InfixExpr(unordered_set<shared_ptr<BoolExpr>> kids) : children{std::move(kids)} {}
+
+   virtual pair<string, string> empty_and_operation() const = 0;
+
+   virtual string to_string() const
    {
-      if (children.find(child) != children.end())
+      auto empty_and_op = empty_and_operation();
+      if (children.empty())
       {
-         return;
+         return empty_and_op.first;
       }
-      if (auto var = reinterpret_cast<Var *>(child.get()))
+
+      string delim = "(";
+      string result;
+      for (const auto &child : children)
       {
-         // Find it's negated twin.
-         auto &temp = Var::all_vars[var->index];
-         myassert((var->first ? temp.first : temp.second).get() == var);
-         shared_ptr<Var> &twin = var->first ? temp.second : temp.first;
-         if (children.find(twin) != children.end())
+         result += delim + ::to_string(child);
+         delim = " " + empty_and_op.second + " ";
+      }
+      return result + ")";
+   }
+};
+
+class OrExpr : public InfixExpr
+{
+public:
+   OrExpr(unordered_set<shared_ptr<BoolExpr>> kids) : InfixExpr{std::move(kids)} {}
+
+   pair<string, string> empty_and_operation() const
+   {
+      return make_pair(string("false"), string("or"));
+   };
+
+   /*
+      void add(shared_ptr<BoolExpr> child)
+      {
+         if (children.find(child) != children.end())
          {
-            // We have "P or not P", which is always true, so replace ourself
-            // with "true", which is just OrExpr of the empty set.
-            children.clear();
-            // If parent is AndExpr, we should get rid of this node entirely.  Hmm.
             return;
          }
+         if (auto var = reinterpret_cast<Var *>(child.get()))
+         {
+            // Find it's negated twin.
+            const auto &temp = Var::all_vars[var->index];
+            myassert((var->first ? temp.first : temp.second).get() == var);
+            const shared_ptr<Var> &twin = var->first ? temp.second : temp.first;
+            if (children.find(twin) != children.end())
+            {
+               // We have "P or not P", which is always true, so replace ourself
+               // with "true", which is just OrExpr of the empty set.
+               children.clear();
+               // If parent is AndExpr, we should get rid of this node entirely.  Hmm.
+               return;
+            }
+         }
+         children.insert(child);
+         // If child is AndExpr, and has a var (or subexression?) in common with
+         // existing child, factor them out: PQ \/ PR = P(Q \/ R)
       }
-      children.insert(child);
-      // If child is AndExpr, and has a var (or subexression?) in common with
-      // existing child, factor them out: PQ \/ PR = P(Q \/ R)
-   }
+      */
 };
 
-class AndExpr : public BoolExpr
+class AndExpr : public InfixExpr
 {
 public:
-   unordered_set<shared_ptr<BoolExpr>> children;
+   AndExpr(unordered_set<shared_ptr<BoolExpr>> kids) : InfixExpr{std::move(kids)} {}
 
-   void add(shared_ptr<BoolExpr> child)
+   pair<string, string> empty_and_operation() const
    {
-      children.insert(child);
-   }
+      return make_pair(string("true"), string("and"));
+   };
+
+   /*
+      void add(shared_ptr<BoolExpr> child)
+      {
+         children.insert(child);
+      }
+      */
 };
+
+void remove_empty(unordered_set<shared_ptr<BoolExpr>> &children)
+{
+   auto iter = children.begin();
+   while (iter != children.end())
+   {
+      auto next = iter;
+      next++;
+      if (iter->get() == nullptr)
+      {
+         children.erase(iter);
+      }
+      iter = next;
+   }
+}
+
+struct FactorResults
+{
+   unordered_set<shared_ptr<BoolExpr>> reduced_first;
+   unordered_set<shared_ptr<BoolExpr>> reduced_second;
+   unordered_set<shared_ptr<BoolExpr>> common;
+};
+
+FactorResults factor_helper(
+    const unordered_set<shared_ptr<BoolExpr>> &first_children,
+    const unordered_set<shared_ptr<BoolExpr>> &second_children)
+{
+   FactorResults results;
+
+   // Copy second->children into second_children.
+   for (auto child2 : second_children)
+   {
+      results.reduced_second.insert(child2);
+   }
+
+   for (auto &child1 : first_children)
+   {
+      auto in_second = results.reduced_second.find(child1);
+      if (in_second != results.reduced_second.end())
+      {
+         results.reduced_second.erase(in_second);
+         results.common.insert(child1);
+      }
+      else
+      {
+         results.reduced_first.insert(child1);
+      }
+   }
+
+   return results;
+}
+
+// (A & B) | (A & C) == A & (B | C)
+// (A | B) & (A | C) == A | (B & C)
+// Generalized to:
+// (A inner B) outer (A inner C) => A inner (B outer C)
+//
+// (A1 inner A2 inner B1 inner B2) outer (A1 inner A2 inner C1 inner C2) =>
+//     A1 inner A2 inner ((B1 inner B2) outer (C1 inner C2))
+
+template <typename ExprT>
+shared_ptr<BoolExpr> make_helper(unordered_set<shared_ptr<BoolExpr>> children)
+{
+   myassert(!children.empty());
+   if (children.size() == 1)
+   {
+      return *children.begin();
+   }
+
+   return make_shared<ExprT>(std::move(children));
+}
+
+template <typename InnerExprT, typename OuterExprT>
+shared_ptr<BoolExpr> factor(const shared_ptr<BoolExpr> &first_in, const shared_ptr<BoolExpr> &second_in)
+{
+   const InnerExprT *first = dynamic_cast<const InnerExprT *>(first_in.get());
+   const InnerExprT *second = dynamic_cast<const InnerExprT *>(second_in.get());
+
+   if (!first || !second)
+   {
+      return make_shared<OuterExprT>(unordered_set<shared_ptr<BoolExpr>>{first_in, second_in});
+   }
+
+   FactorResults factored = factor_helper(first->children, second->children);
+
+   if (factored.common.empty())
+   {
+      return make_shared<OuterExprT>(unordered_set<shared_ptr<BoolExpr>>{first_in, second_in});
+   }
+
+   if (factored.reduced_first.empty() || factored.reduced_second.empty())
+   {
+      return make_helper<InnerExprT>(std::move(factored.common));
+   }
+
+   auto temp =
+       make_helper<OuterExprT>({make_helper<InnerExprT>(std::move(factored.reduced_first)),
+                                make_helper<InnerExprT>(std::move(factored.reduced_second))});
+
+   factored.common.insert(std::move(temp));
+   return make_shared<InnerExprT>(std::move(factored.common));
+}
+
+shared_ptr<BoolExpr> or_(unordered_set<shared_ptr<BoolExpr>> children)
+{
+   remove_empty(children);
+
+   if (children.size() == 1)
+   {
+      return *children.begin();
+   }
+
+   myassert(children.size() == 2);
+   auto iter = children.begin();
+   const shared_ptr<BoolExpr> &first = *iter;
+   ++iter;
+   const shared_ptr<BoolExpr> &second = *iter;
+
+   return factor<AndExpr, OrExpr>(first, second);
+}
+
+shared_ptr<AndExpr> and_(unordered_set<shared_ptr<BoolExpr>> children)
+{
+   remove_empty(children);
+
+   unordered_set<shared_ptr<BoolExpr>> new_kids; // on the block.
+
+   for (const auto &child : children)
+   {
+      if (auto and_expr = dynamic_cast<AndExpr *>(child.get()))
+      {
+         new_kids.insert(and_expr->children.begin(), and_expr->children.end());
+      }
+      else
+      {
+         new_kids.insert(child);
+      }
+   }
+
+   return make_shared<AndExpr>(new_kids);
+}
 
 /**********  Outcomes  **********/
 
@@ -660,12 +878,29 @@ get_scoretuple(game_t match_index, team_t winning_team, uint8_t reduced_points)
    return scores;
 }
 
+struct ResultSet
+{
+   double prob;
+   shared_ptr<BoolExpr> which;
+
+   void combine_disjoint(const ResultSet other)
+   {
+      prob += other.prob;
+      which = or_({which, other.which});
+   }
+};
+
+string to_string(ResultSet result_set)
+{
+   return fmt::format("{:.3f}% ", result_set.prob * 100) + to_string(result_set.which);
+}
+
 struct Outcomes
 {
    team_t team;
-   unordered_map<scoretuple_t, double> scores;
+   unordered_map<scoretuple_t, ResultSet> result_sets;
 
-   Outcomes(team_t team, scoretuple_t scores, double prob) : team(team), scores{{scores, prob}} {}
+   Outcomes(team_t team, scoretuple_t scores, ResultSet set) : team(team), result_sets{{scores, set}} {}
    Outcomes() : team(-1) {}
    Outcomes(team_t team) : team(team) {}
 };
@@ -673,12 +908,12 @@ struct Outcomes
 string to_string(const Outcomes &outcome)
 {
    string result;
-   result += (outcome.team < 0 ? "other" : teams[outcome.team]) + ":";
-   for (const auto scores : outcome.scores)
+   result += (outcome.team < 0 ? "other" : teams[outcome.team].name) + ":\n";
+   for (const auto &scores : outcome.result_sets)
    {
-      result += " " + make_string(scores.first) + " (" + to_string(scores.second) + ")";
+      result += "    " + make_string(scores.first) + " (" + to_string(scores.second) + ")\n";
    }
-   return result + "\n";
+   return result;
 }
 
 Outcomes *find_team(vector<Outcomes> &outcomes, team_t team)
@@ -693,10 +928,10 @@ Outcomes *find_team(vector<Outcomes> &outcomes, team_t team)
    return nullptr;
 }
 
-struct TeamWithProb
+struct TeamInfo
 {
    team_t team;
-   double prob;
+   ResultSet result_set;
 };
 
 // The first element of the vector is always for team "other".
@@ -708,37 +943,37 @@ outcomes(
    const Matchup &game = games[match_index];
    const auto ri = round_index(match_index + 1);
    int this_points = points_per_match[match_index];
-   if (ri.round == 5)
+   if (ri.round == NUM_ROUNDS - 1)
    {
       // Base case, round of 64.
       myassert(this_points == 10);
       vector<Outcomes> result(1);
-      vector<TeamWithProb> teams_with_probs;
+      vector<TeamInfo> teams_with_probs;
       if (game.winner >= 0)
       {
-         teams_with_probs.push_back({game.winner, 1.0});
+         teams_with_probs.push_back({game.winner, {1.0, {}}});
       }
       else
       {
          myassert(game.first_team >= 0);
          myassert(game.second_team >= 0);
          double prob_first = game_prob(game.first_team, game.second_team, game.first_team, ri.round);
-         teams_with_probs.push_back({game.first_team, prob_first});
-         teams_with_probs.push_back({game.second_team, 1.0 - prob_first});
+         teams_with_probs.push_back({game.first_team, {prob_first, Var::all_vars[game.id].first}});
+         teams_with_probs.push_back({game.second_team, {1.0 - prob_first, Var::all_vars[game.id].second}});
       }
 
-      for (const TeamWithProb &team_with_prob : teams_with_probs)
+      for (const TeamInfo &team_with_prob : teams_with_probs)
       {
          auto scores = get_scoretuple(match_index, team_with_prob.team, this_points / 10);
          myassert(team_with_prob.team >= 0);
 
          if (true /* selections[team_with_prob.team] */)
          {
-            result.emplace_back(team_with_prob.team, scores, team_with_prob.prob);
+            result.emplace_back(team_with_prob.team, scores, team_with_prob.result_set);
          }
          else
          {
-            result[0].scores[scores] += team_with_prob.prob;
+            result[0].result_sets[scores].prob += team_with_prob.result_set.prob;
          }
       }
 
@@ -755,9 +990,9 @@ outcomes(
       cout << "About to loop, round " << ri.round << endl;
    }
 
-   for (const auto &outcome1 : outcomes1)
+   for (const Outcomes &outcome1 : outcomes1)
    {
-      if (outcome1.scores.empty())
+      if (outcome1.result_sets.empty())
       {
          continue;
       }
@@ -765,12 +1000,14 @@ outcomes(
       /*
       if (ri.round == 0)
       {
-         cout << (outcome1.team < 0 ? "other" : teams[outcome1.team]) << endl;
-      }
-      */
-      for (const auto &outcome2 : outcomes2)
+         */
+      // cout << (outcome1.team < 0 ? "other" : teams[outcome1.team].name) << endl;
+      /*
+   }
+   */
+      for (const Outcomes &outcome2 : outcomes2)
       {
-         if (outcome2.scores.empty())
+         if (outcome2.result_sets.empty())
          {
             continue;
          }
@@ -778,27 +1015,28 @@ outcomes(
 
          /*
          if (ri.round == 0)
-         {
-            cout << "    " << (outcome2.team < 0 ? "other" : teams[outcome2.team]) << endl;
-         }
-         */
+         {*/
+         // cout << "    " << (outcome2.team < 0 ? "other" : teams[outcome2.team].name) << endl;
+         /*
+      }
+      */
 
-         vector<TeamWithProb> teams_with_probs;
+         vector<TeamInfo> teams_with_probs;
          if (game.winner >= 0)
          {
             // If this game has been played in real life, then all previous games
             // have also been played, so our recursive outcomes had better have
             // only a single non-empty result.
-            myassert(outcomes1.size() == 1 || (outcomes1.size() == 2 && outcomes1[0].scores.empty()));
-            myassert(outcomes2.size() == 1 || (outcomes2.size() == 2 && outcomes2[0].scores.empty()));
+            myassert(outcomes1.size() == 1 || (outcomes1.size() == 2 && outcomes1[0].result_sets.empty()));
+            myassert(outcomes2.size() == 1 || (outcomes2.size() == 2 && outcomes2[0].result_sets.empty()));
             myassert(game.winner == outcome1.team || game.winner == outcome2.team);
-            teams_with_probs.push_back({game.winner, 1.0});
+            teams_with_probs.push_back({game.winner, {1.0, {}}});
          }
          else
          {
             double prob_first = game_prob(outcome1.team, outcome2.team, outcome1.team, ri.round);
-            teams_with_probs.push_back({outcome1.team, prob_first});
-            teams_with_probs.push_back({outcome2.team, 1.0 - prob_first});
+            teams_with_probs.push_back({outcome1.team, {prob_first, Var::all_vars[match_index].first}});
+            teams_with_probs.push_back({outcome2.team, {1.0 - prob_first, Var::all_vars[match_index].second}});
          }
 
          // So if both are "other", do we even need to loop over two winners?
@@ -822,22 +1060,34 @@ outcomes(
                }
             }
 
-            for (const auto score_and_prob1 : outcome1.scores)
+            for (const auto &score_and_prob1 : outcome1.result_sets)
             {
-               for (const auto score_and_prob2 : outcome2.scores)
+               for (const auto &score_and_prob2 : outcome2.result_sets)
                {
                   scoretuple_t total_scores = score_and_prob1.first + score_and_prob2.first;
                   scoretuple_t overall_scores;
+                  ResultSet new_set;
+
                   if (winner.team < 0)
                   {
                      overall_scores = total_scores;
+                     new_set.which = and_({score_and_prob1.second.which, score_and_prob2.second.which});
                   }
                   else
                   {
+                     new_set.which = and_({score_and_prob1.second.which, score_and_prob2.second.which, winner.result_set.which});
                      auto this_scores = get_scoretuple(match_index, winner.team, this_points / 10);
                      overall_scores = total_scores + this_scores;
                   }
-                  dest->scores[normalize(overall_scores)] += winner.prob * score_and_prob1.second * score_and_prob2.second;
+                  // This is where I do the "or" with existing results.;
+                  ResultSet &rset = dest->result_sets[normalize(overall_scores)];
+                  new_set.prob = winner.result_set.prob * score_and_prob1.second.prob * score_and_prob2.second.prob;
+                  /* if (rset.which)
+                  {
+                     cout << "Oring " << to_string(rset.which) << " *WITH* " << to_string(new_set.which) << "\n";
+                     cout << "  Got " << to_string(or_({rset.which, new_set.which})) << "\n";
+                  } */
+                  rset.combine_disjoint(new_set);
                }
             }
          }
@@ -867,7 +1117,8 @@ int main(int argc, char *argv[])
    for (const auto &team : teams_json)
    {
       int id = team["id"].get<int>() - 1;
-      teams[id] = team["n"];
+      teams[id].name = team["n"];
+      teams[id].abbrev = team["a"];
       eid_to_team[team["eid"].get<int>()] = id;
    }
 
@@ -878,6 +1129,14 @@ int main(int argc, char *argv[])
    {
       Matchup m = parse_matchup(matchup);
       games[m.id] = m;
+      if (m.winner < 0)
+      {
+         const string &rname = round_names[round_index(m.id + 1).round];
+         const string first_name = (m.first_team < 0 ? to_string(m.id) + "first" : teams[m.first_team].abbrev);
+         const string second_name = (m.second_team < 0 ? to_string(m.id) + "second" : teams[m.second_team].abbrev);
+         Var::all_vars[m.id] = make_pair(make_shared<Var>(first_name + "-" + rname, m.id, true),
+                                         make_shared<Var>(second_name + "-" + rname, m.id, false));
+      }
    }
 
    for (auto entry : entries)
@@ -894,11 +1153,25 @@ int main(int argc, char *argv[])
    parse_probs();
 
    {
-      cout << "**********  2nd from the top Round of 32 game in the South\n";
-      auto result = outcomes(41, all_selections[41]);
+      cout << "**********  Top Round of 32 game in the South\n";
+      // matches: 16, 17, 40
+      auto result = outcomes(40, all_selections[52]);
       for (const auto &outcome : result)
       {
-         if (!outcome.scores.empty())
+         if (!outcome.result_sets.empty())
+         {
+            cout << to_string(outcome);
+         }
+      }
+   }
+
+   {
+      cout << "**********  2nd from the top Round of 32 game in the South\n";
+      // matches: 18, 19, 41
+      auto result = outcomes(41, all_selections[52]);
+      for (const auto &outcome : result)
+      {
+         if (!outcome.result_sets.empty())
          {
             cout << to_string(outcome);
          }
@@ -913,22 +1186,11 @@ int main(int argc, char *argv[])
 
    {
       cout << "**********  Top Sweet 16 in the South\n";
+      // matches: 16, 17, 18, 19, 40, 41, 52
       auto result = outcomes(52, all_selections[52]);
       for (const auto &outcome : result)
       {
-         if (!outcome.scores.empty())
-         {
-            cout << to_string(outcome);
-         }
-      }
-   }
-
-   {
-      cout << "**********  Wisconsin vs COLG\n";
-      auto result = outcomes(29, all_selections[29]);
-      for (const auto &outcome : result)
-      {
-         if (!outcome.scores.empty())
+         if (!outcome.result_sets.empty())
          {
             cout << to_string(outcome);
          }
@@ -940,9 +1202,9 @@ int main(int argc, char *argv[])
       auto west_east = outcomes(60, all_selections[62]);
       for (const auto &outcome : west_east)
       {
-         if (!outcome.scores.empty())
+         if (!outcome.result_sets.empty())
          {
-            cout << (outcome.team < 0 ? "other" : teams[outcome.team]) << ": " << outcome.scores.size() << "\n";
+            cout << (outcome.team < 0 ? "other" : teams[outcome.team].name) << ": " << outcome.result_sets.size() << "\n";
          }
       }
    }
@@ -952,9 +1214,9 @@ int main(int argc, char *argv[])
       auto midwest_south = outcomes(61, all_selections[62]);
       for (const auto &outcome : midwest_south)
       {
-         if (!outcome.scores.empty())
+         if (!outcome.result_sets.empty())
          {
-            cout << (outcome.team < 0 ? "other" : teams[outcome.team]) << ": " << outcome.scores.size() << "\n";
+            cout << (outcome.team < 0 ? "other" : teams[outcome.team].name) << ": " << outcome.result_sets.size() << "\n";
          }
       }
    }
@@ -964,7 +1226,7 @@ int main(int argc, char *argv[])
       auto start = high_resolution_clock::now();
       auto results = outcomes(62, {});
       cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
-      vector<pair<int, double>> win_probs(NUM_BRACKETS);
+      vector<pair<int, ResultSet>> win_probs(NUM_BRACKETS);
       for (size_t i = 0; i < NUM_BRACKETS; ++i)
       {
          win_probs[i].first = i;
@@ -972,18 +1234,19 @@ int main(int argc, char *argv[])
 
       for (const Outcomes &outc : results)
       {
-         for (const auto &score_and_prob : outc.scores)
+         for (const auto &score_and_result_sets : outc.result_sets)
          {
-            win_probs[winner(score_and_prob.first)].second += score_and_prob.second;
+            win_probs[winner(score_and_result_sets.first)].second.combine_disjoint(
+                score_and_result_sets.second);
          }
       }
 
       cout << "***** Probability of Win for each Bracket *****\n";
       sort(win_probs.begin(), win_probs.end(), [](auto &a, auto &b)
-           { return a.second > b.second; });
+           { return a.second.prob > b.second.prob; });
       for (int i = 0; i < NUM_BRACKETS; ++i)
       {
-         cout << fmt::format("{:<22}: {:5.2f}%\n", brackets[win_probs[i].first].name, win_probs[i].second * 100);
+         cout << fmt::format("{:<22}: {:5.2f}% ", brackets[win_probs[i].first].name, win_probs[i].second.prob * 100) << to_string(win_probs[i].second.which) << "\n";
       }
    }
 
