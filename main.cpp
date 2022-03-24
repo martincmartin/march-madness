@@ -26,6 +26,36 @@
 // don't think he ever updates them between rounds of 64 and 32.  URL:
 // https://projects.fivethirtyeight.com/march-madness-api/2022/fivethirtyeight_ncaa_forecasts.csv
 
+// Well, the problem of finding a minimal boolean expression for a given truth
+// table is NP-hard.
+
+// Well, I can simplify it a little more.  The boolean expressions that come out
+// of the championship, for the unique score tuples but before reducing over
+// individual winners, have expressions of the form (A or (notA and B)), these
+// can be simplified to (A or B).  (And the dual, (A and (notA or B)) ==
+// (A and B)).
+//
+// My other thought is to look for "must win" games, and also pairs and
+// tripples.  That is, "if this game goes the wrong way I'm eliminated, but if
+// it goes the right way, I may or may not win."  The intuition being, if a
+// minimal boolean expression is more complicated than that, it's probably hard
+// to understand or interpret anyway.
+//
+// Current status, as of 10 hours before Sweet 16 starts in 2022:
+//
+// I'm not 100% sure the boolean simplifier is correct.  But it does omptimally
+// simplify expressions, i.e. produce minimal expressions, all the way up to the
+// championship, before we reduce over individual winners.  Once we start
+// reducing over individual winners, the expressions get wicked complicated and
+// it's not clear if this is because (a) there's a bug, (b) it's missing some
+// opportunity for simplifying, or (c) the reality is just really complicated
+// and simplifying is a fools errand that won't provide insight.
+//
+// So we have about 4500 unique score tuples coming out of the championship,
+// each with minimal bool expressions.
+//
+// On question to look at: in the next round, which outcome changes my chance of
+// winning the most?  Which pair or triple of outcomes?
 #include <cstdlib>
 #include <vector>
 #include <iostream>
@@ -601,6 +631,7 @@ public:
    virtual ~BoolExpr() {}
 
    virtual string to_string() const = 0;
+   virtual string sexpr(int indent) const = 0;
 };
 
 string to_string(const shared_ptr<BoolExpr> &ptr)
@@ -621,12 +652,17 @@ struct Var : public BoolExpr
 
    Var(string name, size_t index, bool first) : name(name), index(index), first(first) {}
 
-   string to_string() const
+   string to_string() const override
    {
       return name;
    }
 
-   const shared_ptr<Var> &other() const
+   string sexpr(int /*indent*/) const override
+   {
+      return name;
+   }
+
+   const shared_ptr<Var> &negation() const
    {
       if (first)
       {
@@ -654,7 +690,7 @@ public:
 
    virtual pair<string, string> empty_and_operation() const = 0;
 
-   virtual string to_string() const
+   virtual string to_string() const override
    {
       auto empty_and_op = empty_and_operation();
       if (children.empty())
@@ -670,6 +706,22 @@ public:
          delim = " " + empty_and_op.second + " ";
       }
       return result + ")";
+   }
+
+   virtual string sexpr(int indent) const override
+   {
+      auto empty_and_op = empty_and_operation();
+      if (children.empty())
+      {
+         return empty_and_op.first;
+      }
+
+      string result = "(" + empty_and_op.second + "\n";
+      for (const auto &child : children)
+      {
+         result += string(indent, ' ') + child->sexpr(indent + 2) + "\n";
+      }
+      return result + string(indent, ' ') + ")";
    }
 };
 
@@ -781,25 +833,17 @@ FactorResults factor_helper(
    return results;
 }
 
-// (A & B) | (A & C) == A & (B | C)
-// (A | B) & (A | C) == A | (B & C)
-// Generalized to:
-// (A inner B) outer (A inner C) => A inner (B outer C)
-//
-// (A1 inner A2 inner B1 inner B2) outer (A1 inner A2 inner C1 inner C2) =>
-//     A1 inner A2 inner ((B1 inner B2) outer (C1 inner C2))
-
 template <typename ExprT>
-struct Other;
+struct Dual;
 
 template <>
-struct Other<AndExpr>
+struct Dual<AndExpr>
 {
    using type = OrExpr;
 };
 
 template <>
-struct Other<OrExpr>
+struct Dual<OrExpr>
 {
    using type = AndExpr;
 };
@@ -824,98 +868,236 @@ unordered_set<shared_ptr<BoolExpr>> flatten(unordered_set<shared_ptr<BoolExpr>> 
    return new_kids;
 }
 
-template <typename ExprT>
-shared_ptr<BoolExpr> make_helper(unordered_set<shared_ptr<BoolExpr>> children)
+template <typename OuterExprT>
+pair<shared_ptr<BoolExpr>, bool> factor(const shared_ptr<BoolExpr> &first_in, const shared_ptr<BoolExpr> &second_in);
+
+// A and (notA or B) <==> A and B
+// A or (notA and B) <==> A or B
+//
+// In general:
+// A and X1 and X2 and (notA or B1 or B2) <==> A and X1 and X2 and (B1 or B2)
+
+// This function, also factor(), and the boolean simplifier in general, are
+// complicated enough that they need unit tests.
+template <typename OuterExprT>
+shared_ptr<BoolExpr> special_helper(const unordered_set<shared_ptr<BoolExpr>> &source_children)
 {
-   myassert(!children.empty());
-   if (children.size() == 1)
-   {
-      return *children.begin();
-   }
+   using InnerExprT = typename Dual<OuterExprT>::type;
 
-   auto new_kids = flatten<ExprT>(children);
-
-   for (const auto &child : new_kids)
+   for (const auto &source_child : source_children)
    {
-      if (auto child_var = dynamic_cast<Var *>(child.get()))
+      if (auto source_child_var = dynamic_cast<Var *>(source_child.get()))
       {
-         if (new_kids.find(child_var->other()) != new_kids.end())
+         const auto &negation = source_child_var->negation();
+         // Now we need to find a second child, of the dual type.
+         for (auto dual_iter = source_children.begin(); dual_iter != source_children.end(); ++dual_iter)
          {
-            return make_shared<typename Other<ExprT>::type>(unordered_set<shared_ptr<BoolExpr>>{});
+            if (auto dual = dynamic_cast<InnerExprT *>(dual_iter->get()))
+            {
+               auto negation_iter = dual->children.find(negation);
+               if (negation_iter != dual->children.end())
+               {
+                  // We can simplify!
+                  // Now we copy all of the children except this one.
+                  //
+                  // At this point:
+                  // source_child, source_child_var point to the "outer" var, child of source.
+                  // dual_iter, dual point to the dual, child of source.
+                  // negation_iter points to the negation of var, child of dual.
+                  // cout << "Found " << source_child_var->to_string() << " in outer, and " << to_string(*negation_iter) << " in inner.\n";
+
+                  bool raised_node = false;
+                  unordered_set<shared_ptr<BoolExpr>> result;
+                  for (auto dual_iter2 = source_children.begin(); dual_iter2 != source_children.end(); ++dual_iter2)
+                  {
+                     if (dual_iter2 != dual_iter)
+                     {
+                        result.insert(*dual_iter2);
+                     }
+                     else
+                     {
+                        // For this child, take everything but the negation var.
+                        unordered_set<shared_ptr<BoolExpr>> new_dual_children;
+                        for (auto dual_child_iter = dual->children.begin(); dual_child_iter != dual->children.end(); ++dual_child_iter)
+                        {
+                           if (dual_child_iter != negation_iter)
+                           {
+                              new_dual_children.insert(*dual_child_iter);
+                           }
+                        }
+                        myassert(new_dual_children.size() >= 1);
+                        if (new_dual_children.size() == 1)
+                        {
+                           raised_node = true;
+                           result.insert(*new_dual_children.begin());
+                        }
+                        else
+                        {
+                           result.insert(make_shared<InnerExprT>(std::move(new_dual_children)));
+                        }
+                     }
+                  }
+                  // cout << "Replacing " << to_string(make_shared<OuterExprT>(source_children)) << " with " << to_string(make_shared<OuterExprT>(result)) << "\n";
+                  if (raised_node)
+                  {
+                     return make_helper<OuterExprT>(result);
+                  }
+                  return make_helper<OuterExprT>(result);
+               }
+            }
          }
       }
    }
 
+   return make_shared<OuterExprT>(source_children);
+}
+
+shared_ptr<BoolExpr> special(const shared_ptr<BoolExpr> source)
+{
+   if (auto and_expr = dynamic_cast<const AndExpr *>(source.get()))
+   {
+      return special_helper<AndExpr>(and_expr->children);
+   }
+   else if (auto or_expr = dynamic_cast<const OrExpr *>(source.get()))
+   {
+      return special_helper<OrExpr>(or_expr->children);
+   }
+   return source;
+}
+
+template <typename ExprT>
+shared_ptr<BoolExpr> make_helper(unordered_set<shared_ptr<BoolExpr>> children, bool try_factor = false)
+{
    if (children.size() == 1)
    {
       return *children.begin();
    }
 
-   return make_shared<ExprT>(std::move(new_kids));
+   children = flatten<ExprT>(children);
+
+   if (children.size() == 1)
+   {
+      return *children.begin();
+   }
+
+   for (const auto &child : children)
+   {
+      if (auto child_var = dynamic_cast<Var *>(child.get()))
+      {
+         if (children.find(child_var->negation()) != children.end())
+         {
+            return make_shared<typename Dual<ExprT>::type>(unordered_set<shared_ptr<BoolExpr>>{});
+         }
+      }
+   }
+
+   if (try_factor)
+   {
+      vector<shared_ptr<BoolExpr>> kids;
+      for (const auto &child : children)
+      {
+         kids.emplace_back(child);
+      }
+      bool modified = false;
+
+      children.clear();
+      while (kids.size() >= 2)
+      {
+         bool got_one = false;
+         for (size_t j = 0; j < kids.size() - 1; ++j)
+         {
+            auto [expr, factored] = factor<ExprT>(kids[j], kids[kids.size() - 1]);
+            if (factored)
+            {
+               modified = true;
+               got_one = true;
+               children.insert(expr);
+               kids.erase(kids.begin() + j);
+               break;
+            }
+         }
+         if (!got_one)
+         {
+            children.insert(kids[kids.size() - 1]);
+         }
+         kids.pop_back();
+      }
+      for (auto &kid : kids)
+      {
+         children.insert(kid);
+      }
+
+      // Only recursively call ourselves if we actually factored something out
+      // above, to avoid infinite recursion.
+      if (modified)
+      {
+         // return make_helper<ExprT>(std::move(children));
+         return special(make_helper<ExprT>(std::move(children)));
+      }
+   }
+
+   // return make_shared<ExprT>(std::move(children));
+   return special(make_shared<ExprT>(std::move(children)));
 }
 
-template <typename InnerExprT, typename OuterExprT>
-shared_ptr<BoolExpr> factor(const shared_ptr<BoolExpr> &first_in, const shared_ptr<BoolExpr> &second_in)
+// (A & B) | (A & C) == A & (B | C)
+// (A | B) & (A | C) == A | (B & C)
+// Generalized to:
+// (A inner B) outer (A inner C) => A inner (B outer C)
+//
+// (A1 inner A2 inner B1 inner B2) outer (A1 inner A2 inner C1 inner C2) =>
+//     A1 inner A2 inner ((B1 inner B2) outer (C1 inner C2))
+
+// Bool in return: "false" means we didn't factor anything out, and return
+// expression is just the two inputs.  "true" means we did factor something out.
+template <typename OuterExprT>
+pair<shared_ptr<BoolExpr>, bool> factor(const shared_ptr<BoolExpr> &first_in, const shared_ptr<BoolExpr> &second_in)
 {
+   using InnerExprT = typename Dual<OuterExprT>::type;
+
    const InnerExprT *first = dynamic_cast<const InnerExprT *>(first_in.get());
    const InnerExprT *second = dynamic_cast<const InnerExprT *>(second_in.get());
 
    if (!first || !second)
    {
-      return make_shared<OuterExprT>(unordered_set<shared_ptr<BoolExpr>>{first_in, second_in});
+      return make_pair(make_shared<OuterExprT>(unordered_set<shared_ptr<BoolExpr>>{first_in, second_in}), false);
    }
 
    FactorResults factored = factor_helper(first->children, second->children);
 
    if (factored.common.empty())
    {
-      return make_helper<OuterExprT>(unordered_set<shared_ptr<BoolExpr>>{first_in, second_in});
+      return make_pair(make_helper<OuterExprT>(unordered_set<shared_ptr<BoolExpr>>{first_in, second_in}), false);
    }
 
    if (factored.reduced_first.empty() || factored.reduced_second.empty())
    {
-      return make_helper<InnerExprT>(std::move(factored.common));
+      return make_pair(make_helper<InnerExprT>(std::move(factored.common)), true);
    }
 
    auto temp =
        make_helper<OuterExprT>({make_helper<InnerExprT>(std::move(factored.reduced_first)),
-                                make_helper<InnerExprT>(std::move(factored.reduced_second))});
+                                make_helper<InnerExprT>(std::move(factored.reduced_second))},
+                               true /* try_factor */);
 
    factored.common.insert(std::move(temp));
-   return make_helper<InnerExprT>(std::move(factored.common));
+   return make_pair(make_helper<InnerExprT>(std::move(factored.common)), true);
 }
 
 shared_ptr<BoolExpr> or_(unordered_set<shared_ptr<BoolExpr>> children)
 {
    remove_empty(children);
 
-   if (children.size() == 1)
-   {
-      return *children.begin();
-   }
-
-   myassert(children.size() == 2);
-   auto iter = children.begin();
-   const shared_ptr<BoolExpr> &first = *iter;
-   ++iter;
-   const shared_ptr<BoolExpr> &second = *iter;
-
-   if (auto first_var = dynamic_cast<Var *>(first.get()))
-   {
-      if (first_var->other().get() == second.get())
-      {
-         return make_shared<OrExpr>(unordered_set<shared_ptr<BoolExpr>>());
-      }
-   }
-
-   return factor<AndExpr, OrExpr>(first, second);
+   return make_helper<OrExpr>(children, true);
 }
 
-shared_ptr<AndExpr> and_(unordered_set<shared_ptr<BoolExpr>> children)
+shared_ptr<BoolExpr> and_(unordered_set<shared_ptr<BoolExpr>> children)
 {
    remove_empty(children);
 
-   return make_shared<AndExpr>(flatten<AndExpr>(children));
+   return make_helper<AndExpr>(children, true);
+
+   // return make_shared<AndExpr>(flatten<AndExpr>(children));
 }
 
 /**********  Outcomes  **********/
@@ -1142,11 +1324,13 @@ outcomes(
                   // This is where I do the "or" with existing results.;
                   ResultSet &rset = dest->result_sets[normalize(overall_scores)];
                   new_set.prob = winner.result_set.prob * score_and_prob1.second.prob * score_and_prob2.second.prob;
-                  /* if (rset.which)
+                  /*
+                  if (rset.which)
                   {
                      cout << "Oring " << to_string(rset.which) << " *WITH* " << to_string(new_set.which) << "\n";
                      cout << "  Got " << to_string(or_({rset.which, new_set.which})) << "\n";
-                  } */
+                  }
+                  */
                   rset.combine_disjoint(new_set);
                }
             }
@@ -1212,6 +1396,7 @@ int main(int argc, char *argv[])
 
    parse_probs();
 
+#if 0
    {
       cout << "**********  Top Round of 32 game in the South\n";
       // matches: 16, 17, 40
@@ -1257,6 +1442,12 @@ int main(int argc, char *argv[])
       }
    }
 
+   // Elite 8 games:
+   // 56: West
+   // 57: East
+   // 58: South
+   // 59: Midwest
+
    {
       cout << "**********  Elite 8 in the South\n";
       // matches: 16, 17, 18, 19, 20, 21, 22, 23, 40, 41, 42, 43, 52, 53, 58
@@ -1281,6 +1472,7 @@ int main(int argc, char *argv[])
          }
       }
    }
+#endif
 
    {
       cout << "**********  Final 4 West & East\n";
@@ -1294,8 +1486,6 @@ int main(int argc, char *argv[])
       }
    }
 
-   return 0;
-
    {
       cout << "**********  Midwest & South\n";
       auto midwest_south = outcomes(61, all_selections[62]);
@@ -1303,7 +1493,9 @@ int main(int argc, char *argv[])
       {
          if (!outcome.result_sets.empty())
          {
-            cout << (outcome.team < 0 ? "other" : teams[outcome.team].name) << ": " << outcome.result_sets.size() << "\n";
+            cout << to_string(outcome);
+
+            // cout << (outcome.team < 0 ? "other" : teams[outcome.team].name) << ": " << outcome.result_sets.size() << "\n";
          }
       }
    }
@@ -1313,6 +1505,19 @@ int main(int argc, char *argv[])
       auto start = high_resolution_clock::now();
       auto results = outcomes(62, {});
       cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
+
+      for (const auto &outcome : results)
+      {
+         if (!outcome.result_sets.empty())
+         {
+            cout << to_string(outcome);
+
+            // cout << (outcome.team < 0 ? "other" : teams[outcome.team].name) << ": " << outcome.result_sets.size() << "\n";
+         }
+      }
+
+      // return 0;
+
       vector<pair<int, ResultSet>> win_probs(NUM_BRACKETS);
       for (size_t i = 0; i < NUM_BRACKETS; ++i)
       {
@@ -1333,7 +1538,7 @@ int main(int argc, char *argv[])
            { return a.second.prob > b.second.prob; });
       for (int i = 0; i < NUM_BRACKETS; ++i)
       {
-         cout << fmt::format("{:<22}: {:5.2f}% ", brackets[win_probs[i].first].name, win_probs[i].second.prob * 100) << to_string(win_probs[i].second.which) << "\n";
+         cout << fmt::format("{:<22}: {:5.2f}% ", brackets[win_probs[i].first].name, win_probs[i].second.prob * 100) << (win_probs[i].second.which)->sexpr(0) << "\n";
       }
    }
 
