@@ -70,6 +70,16 @@
 #include <curl/curl.h>
 #include <chrono>
 
+#define WITH_BOOLEXPR 0
+
+#if WITH_BOOLEXPR
+#define BOOLEXPR(expr) expr
+#else
+#define BOOLEXPR(expr)
+#endif
+
+#define COMMA ,
+
 // constexpr const char *WHEN_RUN = "mid2-roundof32";
 constexpr const char *WHEN_RUN = "before-sweet16";
 
@@ -625,6 +635,8 @@ void make_all_selections()
 
 /**********  Boolean Expressions, for "paths of glory"  **********/
 
+#if WITH_BOOLEXPR
+
 class BoolExpr
 {
 public:
@@ -734,34 +746,6 @@ public:
    {
       return make_pair(string("false"), string("or"));
    };
-
-   /*
-      void add(shared_ptr<BoolExpr> child)
-      {
-         if (children.find(child) != children.end())
-         {
-            return;
-         }
-         if (auto var = reinterpret_cast<Var *>(child.get()))
-         {
-            // Find it's negated twin.
-            const auto &temp = Var::all_vars[var->index];
-            myassert((var->first ? temp.first : temp.second).get() == var);
-            const shared_ptr<Var> &twin = var->first ? temp.second : temp.first;
-            if (children.find(twin) != children.end())
-            {
-               // We have "P or not P", which is always true, so replace ourself
-               // with "true", which is just OrExpr of the empty set.
-               children.clear();
-               // If parent is AndExpr, we should get rid of this node entirely.  Hmm.
-               return;
-            }
-         }
-         children.insert(child);
-         // If child is AndExpr, and has a var (or subexression?) in common with
-         // existing child, factor them out: PQ \/ PR = P(Q \/ R)
-      }
-      */
 };
 
 class AndExpr : public InfixExpr
@@ -773,13 +757,6 @@ public:
    {
       return make_pair(string("true"), string("and"));
    };
-
-   /*
-      void add(shared_ptr<BoolExpr> child)
-      {
-         children.insert(child);
-      }
-      */
 };
 
 void remove_empty(unordered_set<shared_ptr<BoolExpr>> &children)
@@ -1100,6 +1077,8 @@ shared_ptr<BoolExpr> and_(unordered_set<shared_ptr<BoolExpr>> children)
    // return make_shared<AndExpr>(flatten<AndExpr>(children));
 }
 
+#endif // WITH_BOOLEXPR
+
 /**********  Outcomes  **********/
 
 scoretuple_t
@@ -1123,18 +1102,22 @@ get_scoretuple(game_t match_index, team_t winning_team, uint8_t reduced_points)
 struct ResultSet
 {
    double prob;
+#if WITH_BOOLEXPR
    shared_ptr<BoolExpr> which;
+#endif
 
    void combine_disjoint(const ResultSet other)
    {
       prob += other.prob;
+#if WITH_BOOLEXPR
       which = or_({which, other.which});
+#endif
    }
 };
 
 string to_string(ResultSet result_set)
 {
-   return fmt::format("{:.3f}% ", result_set.prob * 100) + to_string(result_set.which);
+   return fmt::format("{:.3f}% ", result_set.prob * 100) BOOLEXPR(+to_string(result_set.which));
 }
 
 struct Outcomes
@@ -1193,15 +1176,15 @@ outcomes(
       vector<TeamInfo> teams_with_probs;
       if (game.winner >= 0)
       {
-         teams_with_probs.push_back({game.winner, {1.0, {}}});
+         teams_with_probs.push_back({game.winner, {1.0 BOOLEXPR(COMMA{})}});
       }
       else
       {
          myassert(game.first_team >= 0);
          myassert(game.second_team >= 0);
          double prob_first = game_prob(game.first_team, game.second_team, game.first_team, ri.round);
-         teams_with_probs.push_back({game.first_team, {prob_first, Var::all_vars[game.id].first}});
-         teams_with_probs.push_back({game.second_team, {1.0 - prob_first, Var::all_vars[game.id].second}});
+         teams_with_probs.push_back({game.first_team, {prob_first BOOLEXPR(COMMA Var::all_vars[game.id].first)}});
+         teams_with_probs.push_back({game.second_team, {1.0 - prob_first BOOLEXPR(COMMA Var::all_vars[game.id].second)}});
       }
 
       for (const TeamInfo &team_with_prob : teams_with_probs)
@@ -1272,13 +1255,13 @@ outcomes(
             myassert(outcomes1.size() == 1 || (outcomes1.size() == 2 && outcomes1[0].result_sets.empty()));
             myassert(outcomes2.size() == 1 || (outcomes2.size() == 2 && outcomes2[0].result_sets.empty()));
             myassert(game.winner == outcome1.team || game.winner == outcome2.team);
-            teams_with_probs.push_back({game.winner, {1.0, {}}});
+            teams_with_probs.push_back({game.winner, {1.0 BOOLEXPR(COMMA{})}});
          }
          else
          {
             double prob_first = game_prob(outcome1.team, outcome2.team, outcome1.team, ri.round);
-            teams_with_probs.push_back({outcome1.team, {prob_first, Var::all_vars[match_index].first}});
-            teams_with_probs.push_back({outcome2.team, {1.0 - prob_first, Var::all_vars[match_index].second}});
+            teams_with_probs.push_back({outcome1.team, {prob_first BOOLEXPR(COMMA Var::all_vars[match_index].first)}});
+            teams_with_probs.push_back({outcome2.team, {1.0 - prob_first BOOLEXPR(COMMA Var::all_vars[match_index].second)}});
          }
 
          // So if both are "other", do we even need to loop over two winners?
@@ -1313,11 +1296,15 @@ outcomes(
                   if (winner.team < 0)
                   {
                      overall_scores = total_scores;
+#if WITH_BOOLEXPR
                      new_set.which = and_({score_and_prob1.second.which, score_and_prob2.second.which});
+#endif
                   }
                   else
                   {
+#if WITH_BOOLEXPR
                      new_set.which = and_({score_and_prob1.second.which, score_and_prob2.second.which, winner.result_set.which});
+#endif
                      auto this_scores = get_scoretuple(match_index, winner.team, this_points / 10);
                      overall_scores = total_scores + this_scores;
                   }
@@ -1331,6 +1318,7 @@ outcomes(
                      cout << "  Got " << to_string(or_({rset.which, new_set.which})) << "\n";
                   }
                   */
+
                   rset.combine_disjoint(new_set);
                }
             }
@@ -1373,6 +1361,7 @@ int main(int argc, char *argv[])
    {
       Matchup m = parse_matchup(matchup);
       games[m.id] = m;
+#if WITH_BOOLEXPR
       if (m.winner < 0)
       {
          const string &rname = round_names[round_index(m.id + 1).round];
@@ -1381,6 +1370,7 @@ int main(int argc, char *argv[])
          Var::all_vars[m.id] = make_pair(make_shared<Var>(first_name + "-" + rname, m.id, true),
                                          make_shared<Var>(second_name + "-" + rname, m.id, false));
       }
+#endif
    }
 
    for (auto entry : entries)
@@ -1538,7 +1528,11 @@ int main(int argc, char *argv[])
            { return a.second.prob > b.second.prob; });
       for (int i = 0; i < NUM_BRACKETS; ++i)
       {
-         cout << fmt::format("{:<22}: {:5.2f}% ", brackets[win_probs[i].first].name, win_probs[i].second.prob * 100) << (win_probs[i].second.which)->sexpr(0) << "\n";
+         cout << fmt::format("{:<22}: {:5.2f}% ", brackets[win_probs[i].first].name, win_probs[i].second.prob * 100)
+#if WITH_BOOLEXPR
+              << (win_probs[i].second.which)->sexpr(0)
+#endif
+              << "\n";
       }
    }
 
