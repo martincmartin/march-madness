@@ -81,18 +81,18 @@
 #define COMMA ,
 
 // constexpr const char *WHEN_RUN = "mid2-roundof32";
-constexpr const char *WHEN_RUN = "before-sweet16";
+constexpr const char *WHEN_RUN = "mid-sweet16";
 
 #define YEAR "2022"
 
 constexpr const char *PROBS_FNAME = YEAR "/{}-fivethirtyeight_ncaa_forecasts.csv";
 
-constexpr size_t NUM_TEAMS = 64;
-constexpr size_t NUM_GAMES = NUM_TEAMS - 1;
-constexpr size_t NUM_ROUNDS = 6;
-
 using game_t = int_fast8_t;
 using team_t = int_fast8_t;
+
+constexpr team_t NUM_TEAMS = 64;
+constexpr game_t NUM_GAMES = NUM_TEAMS - 1;
+constexpr size_t NUM_ROUNDS = 6;
 
 using namespace std;
 
@@ -109,7 +109,7 @@ array<uint64_t, NUM_BRACKETS> entries{
     61439241, // Vakidis (Billy (Maureen's Husband), wgarbarini)
     62484411, // Owe'n Charlie '22 (Uncle Dennis, tiger72pu)
     65481077, // Maureen's Annual Bonus (Joe (Eileen's Husband), gettinpiggywitit)
-    69629125, // RPcatsmounts! espn88461517
+    69629125, // RPcatsmounts! espn88461517 (Ryan Price, Dan's step brother)
               // 61783453,  # Villa-Mo-va 1 (Maureen (Dan's Sister), Villa-Mo-va)
 };
 
@@ -471,22 +471,31 @@ const array<const string, NUM_ROUNDS> round_names{
 using scoretuple_t = uint64_t; // For more than 8 players, need uint128_t.
 static_assert(sizeof(scoretuple_t) >= NUM_BRACKETS);
 
-int winner(scoretuple_t scores)
+pair<int, int> winner(scoretuple_t scores)
 {
    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&scores);
 
    uint8_t biggest = bytes[0];
-   int index = 0;
+   int biggest_index = 0;
+   uint8_t second_biggest = 0;
+   int second_biggest_index = -1;
    for (size_t i = 1; i < NUM_BRACKETS; i++)
    {
       if (bytes[i] > biggest)
       {
+         second_biggest = biggest;
+         second_biggest_index = biggest_index;
          biggest = bytes[i];
-         index = i;
+         biggest_index = i;
+      }
+      else if (second_biggest_index < 0 || bytes[i] > second_biggest)
+      {
+         second_biggest = bytes[i];
+         second_biggest_index = i;
       }
    }
 
-   return index;
+   return make_pair(biggest_index, second_biggest_index);
 }
 
 scoretuple_t normalize(scoretuple_t input)
@@ -722,6 +731,14 @@ public:
 
    virtual string sexpr(int indent) const override
    {
+      if (indent == 6)
+      {
+         return "...";
+      }
+      if (indent > 6)
+      {
+         return "";
+      }
       auto empty_and_op = empty_and_operation();
       if (children.empty())
       {
@@ -1210,10 +1227,12 @@ outcomes(
    const auto outcomes1 = outcomes(prev_match, all_selections[match_index]);
    const auto outcomes2 = outcomes(prev_match + 1, all_selections[match_index]);
    vector<Outcomes> result(1);
+   /*
    if (ri.round <= 1)
    {
       cout << "About to loop, round " << ri.round << endl;
    }
+   */
 
    for (const Outcomes &outcome1 : outcomes1)
    {
@@ -1326,10 +1345,12 @@ outcomes(
       }
    }
 
+   /*
    if (ri.round <= 1)
    {
       cout << "loop done.\n";
    }
+   */
    return result;
 }
 
@@ -1337,6 +1358,116 @@ template <typename Clock>
 double elapsed(time_point<Clock> start, time_point<Clock> end)
 {
    return duration_cast<microseconds>(end - start).count() / 1e6;
+}
+
+vector<tuple<int, ResultSet, ResultSet>> get_win_probs(const vector<Outcomes> &outcomes)
+{
+   vector<tuple<int, ResultSet, ResultSet>> win_probs(NUM_BRACKETS);
+
+   for (size_t i = 0; i < NUM_BRACKETS; ++i)
+   {
+      get<0>(win_probs[i]) = i;
+   }
+
+   for (const Outcomes &outc : outcomes)
+   {
+      for (const auto &score_and_result_sets : outc.result_sets)
+      {
+         auto [biggest_index, second_biggest_index] = winner(score_and_result_sets.first);
+         get<1>(win_probs[biggest_index]).combine_disjoint(score_and_result_sets.second);
+         get<2>(win_probs[second_biggest_index]).combine_disjoint(score_and_result_sets.second);
+      }
+   }
+
+   return win_probs;
+}
+
+team_t must_win(game_t match_index, int bracket)
+{
+   Matchup &matchup = games[match_index];
+   auto original_winner = matchup.winner;
+
+   matchup.winner = matchup.first_team;
+   myassert(matchup.winner >= 0);
+   auto win_probs = get_win_probs(outcomes(62, {}));
+   if (get<1>(win_probs[bracket]).prob == 0)
+   {
+      matchup.winner = original_winner;
+      return matchup.second_team;
+   }
+
+   matchup.winner = matchup.second_team;
+   myassert(matchup.winner >= 0);
+   win_probs = get_win_probs(outcomes(62, {}));
+   if (get<1>(win_probs[bracket]).prob == 0)
+   {
+      matchup.winner = original_winner;
+      return matchup.first_team;
+   }
+
+   matchup.winner = original_winner;
+   return -1;
+}
+
+void alternatives(int bracket_to_consider, const vector<team_t> &matches_to_consider)
+{
+   vector<game_t> single_eliminated;
+   for (game_t match_index : matches_to_consider)
+   {
+      team_t team_must_win = must_win(match_index, bracket_to_consider);
+
+      if (team_must_win > 0)
+      {
+         cout << "::::: " << teams[team_must_win].name << " (game " << (int)match_index << ") must win or bracket will be eliminted!\n";
+         single_eliminated.push_back(match_index);
+      }
+   }
+   for (size_t i = 0; i < matches_to_consider.size(); i++)
+   {
+      team_t first_match_index = matches_to_consider[i];
+      if (find(single_eliminated.begin(), single_eliminated.end(), first_match_index) != single_eliminated.end())
+      {
+         continue;
+      }
+
+      Matchup &matchup = games[first_match_index];
+      auto original_winner = matchup.winner;
+
+      matchup.winner = matchup.first_team;
+      myassert(matchup.winner >= 0);
+      for (size_t j = i + 1; j < matches_to_consider.size(); j++)
+      {
+         team_t second_match_index = matches_to_consider[j];
+         if (find(single_eliminated.begin(), single_eliminated.end(), second_match_index) != single_eliminated.end())
+         {
+            continue;
+         }
+         team_t team_must_win = must_win(second_match_index, bracket_to_consider);
+
+         if (team_must_win > 0)
+         {
+            cout << "***** Either " << teams[matchup.second_team].name << " (game " << (int)first_match_index << ") or " << teams[team_must_win].name << " (game " << (int)second_match_index << ") must win or bracket will be eliminted!\n";
+         }
+      }
+
+      matchup.winner = matchup.second_team;
+      myassert(matchup.winner >= 0);
+      for (size_t j = i + 1; j < matches_to_consider.size(); j++)
+      {
+         team_t second_match_index = matches_to_consider[j];
+         if (find(single_eliminated.begin(), single_eliminated.end(), second_match_index) != single_eliminated.end())
+         {
+            continue;
+         }
+         team_t team_must_win = must_win(second_match_index, bracket_to_consider);
+
+         if (team_must_win > 0)
+         {
+            cout << "***** Either " << teams[matchup.first_team].name << " (game " << (int)first_match_index << ") or " << teams[team_must_win].name << " (game " << (int)second_match_index << ") must win or bracket will be eliminted!\n";
+         }
+      }
+      matchup.winner = original_winner;
+   }
 }
 
 /**********  Putting it all together  **********/
@@ -1385,6 +1516,14 @@ int main(int argc, char *argv[])
    myassert(all_selections.size() == NUM_GAMES);
 
    parse_probs();
+
+   for (team_t i = 48; i < 48 + 8; i++)
+   {
+      cout << "Game " << (int)i << ": " << teams[games[i].first_team].name << " vs " << teams[games[i].second_team].name << "\n";
+   }
+   cout << "Game 58 input: " << input(58) << "\n";
+   cout << "   " << teams[games[input(58)].first_team].name << ", " << teams[games[input(58)].second_team].name << "\n";
+   cout << "Game 61 input: " << input(61) << "\n";
 
 #if 0
    {
@@ -1462,7 +1601,6 @@ int main(int argc, char *argv[])
          }
       }
    }
-#endif
 
    {
       cout << "**********  Final 4 West & East\n";
@@ -1489,13 +1627,28 @@ int main(int argc, char *argv[])
          }
       }
    }
+#endif
+
+   // games[53].winner = games[53].first_team; //  Michigan 11 wins (Villanova 2 loses)
+
+   // Outcomes that would most help my win percentage:
+   // games[51].winner = games[51].second_team; // St. Peter's 15 wins (Purdue 3 loses)
+   // games[53].winner = games[53].first_team;  //  Michigan 11 wins (Villanova 2 loses)
+
+   // In order played:
+
+   // games[48].winner = games[48].first_team; // Gonzaga 1 wins (Arkansas 4 loses), 10.00% -> 10.72%
+   // games[53].winner = games[53].first_team; // Michigan 11 wins (Villanova 2 loses) 10.72% -> 13.96%
+   // games[49].winner = games[49].first_team; // Texas Tech 3 wins (Duke 2 loses)
+   // games[52].winner = games[52].first_team; // Arizona 1 wins (Houston 5 loses)
 
    {
       cout << "**********  Whole Thing!\n";
-      auto start = high_resolution_clock::now();
+      // auto start = high_resolution_clock::now();
       auto results = outcomes(62, {});
-      cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
+      // cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
 
+      /*
       for (const auto &outcome : results)
       {
          if (!outcome.result_sets.empty())
@@ -1505,35 +1658,71 @@ int main(int argc, char *argv[])
             // cout << (outcome.team < 0 ? "other" : teams[outcome.team].name) << ": " << outcome.result_sets.size() << "\n";
          }
       }
+      */
 
       // return 0;
 
-      vector<pair<int, ResultSet>> win_probs(NUM_BRACKETS);
-      for (size_t i = 0; i < NUM_BRACKETS; ++i)
-      {
-         win_probs[i].first = i;
-      }
+      auto win_probs = get_win_probs(results);
 
-      for (const Outcomes &outc : results)
-      {
-         for (const auto &score_and_result_sets : outc.result_sets)
-         {
-            win_probs[winner(score_and_result_sets.first)].second.combine_disjoint(
-                score_and_result_sets.second);
-         }
-      }
-
-      cout << "***** Probability of Win for each Bracket *****\n";
       sort(win_probs.begin(), win_probs.end(), [](auto &a, auto &b)
-           { return a.second.prob > b.second.prob; });
+           { return get<1>(a).prob == get<1>(b).prob ? get<2>(a).prob > get<2>(b).prob : get<1>(a).prob > get<1>(b).prob; });
+
+      cout << "***** Probability of Win & 2nd place for each Bracket *****\n";
       for (int i = 0; i < NUM_BRACKETS; ++i)
       {
-         cout << fmt::format("{:<22}: {:5.2f}% ", brackets[win_probs[i].first].name, win_probs[i].second.prob * 100)
+         cout << fmt::format("{:<22}: {:5.2f}% {:5.2f}%", brackets[get<0>(win_probs[i])].name, get<1>(win_probs[i]).prob * 100, get<2>(win_probs[i]).prob * 100)
 #if WITH_BOOLEXPR
-              << (win_probs[i].second.which)->sexpr(0)
+              << (get<1>(win_probs[i]).which)->sexpr(0)
 #endif
               << "\n";
       }
+   }
+
+   struct AlternateWinProb
+   {
+      game_t match;
+      bool first;
+      team_t winning_team;
+      double prob;
+   };
+
+   vector<game_t> matches_to_consider{50, 51, 54, 55};
+   // vector<game_t> matches_to_consider{48, 49, 50, 51, 52, 53, 54, 55};
+
+   /*
+   int bracket_to_consider = 3;
+   cout << "**********  " << brackets[bracket_to_consider].name << "  **********\n";
+      vector<AlternateWinProb> alternate_win_probs;
+      for (game_t match_index : matches_to_consider)
+      {
+         Matchup &matchup = games[match_index];
+         auto original_winner = matchup.winner;
+
+         matchup.winner = matchup.first_team;
+         auto results = outcomes(62, {});
+         auto win_probs = get_win_probs(results);
+         alternate_win_probs.push_back({match_index, true, matchup.winner, win_probs[bracket_to_consider].second.prob});
+
+         matchup.winner = matchup.second_team;
+         results = outcomes(62, {});
+         win_probs = get_win_probs(results);
+         alternate_win_probs.push_back({match_index, false, matchup.winner, win_probs[bracket_to_consider].second.prob});
+
+         matchup.winner = original_winner;
+      }
+      sort(alternate_win_probs.begin(), alternate_win_probs.end(), [](auto &a, auto &b)
+           { return a.prob > b.prob; });
+
+      for (const auto alt : alternate_win_probs)
+      {
+         cout << fmt::format("{:5.2f}% {} ({} {})\n", alt.prob * 100, teams[alt.winning_team].name, alt.match, alt.first ? "first" : "second");
+      }
+      */
+
+   for (int bracket_to_consider = 0; bracket_to_consider < NUM_BRACKETS; ++bracket_to_consider)
+   {
+      cout << "**********  " << brackets[bracket_to_consider].name << "  **********\n";
+      alternatives(bracket_to_consider, matches_to_consider);
    }
 
    return 0;
