@@ -69,6 +69,8 @@
 #include <bit>
 #include <curl/curl.h>
 #include <chrono>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define WITH_BOOLEXPR 0
 
@@ -80,8 +82,8 @@
 
 #define COMMA ,
 
-// constexpr const char *WHEN_RUN = "mid2-roundof32";
-constexpr const char *WHEN_RUN = "mid-sweet16";
+// constexpr const char *WHEN_RUN = "mid-elite8";
+constexpr const char *WHEN_RUN = "before-roundof64";
 
 #define YEAR "2022"
 
@@ -93,6 +95,12 @@ using team_t = int_fast8_t;
 constexpr team_t NUM_TEAMS = 64;
 constexpr game_t NUM_GAMES = NUM_TEAMS - 1;
 constexpr size_t NUM_ROUNDS = 6;
+
+// In 2022, before-roundof64 had ~ 16M in South-Midwest, which my Mackbook Air
+// could do in 1.6 seconds.  So we want the threshold higher than that.
+constexpr size_t MONTE_CARLO_THRESHOLD = 100'000'000;
+// constexpr size_t MONTE_CARLO_THRESHOLD = 10;
+constexpr size_t MONTE_CARLO_ITERS = 1'000'000;
 
 using namespace std;
 
@@ -113,6 +121,8 @@ array<uint64_t, NUM_BRACKETS> entries{
               // 61783453,  # Villa-Mo-va 1 (Maureen (Dan's Sister), Villa-Mo-va)
 };
 
+/**********  Utilities: asserts and random number generator  **********/
+
 void assert_failed(const char *expr)
 {
    fprintf(stderr, "Assertion failed: %s\n", expr);
@@ -132,6 +142,63 @@ vector<string> split(string source, char delim)
    }
    return result;
 }
+
+template <typename Clock>
+double elapsed(time_point<Clock> start, time_point<Clock> end)
+{
+   return duration_cast<microseconds>(end - start).count() / 1e6;
+}
+
+uint64_t get_urandom()
+{
+   int fd = open("/dev/urandom", O_RDONLY);
+   if (fd < 0)
+   {
+      cerr << "Failed to open /dev/urandom\n";
+      abort();
+   }
+
+   uint64_t result;
+   ssize_t bytes_read = read(fd, &result, sizeof(uint64_t));
+   if (bytes_read != sizeof(uint64_t))
+   {
+      cerr << "Error reading from /dev/urandom\n";
+      abort();
+   }
+
+   return result;
+}
+
+// From Numerical Recipes, Third Edition, Section 7.1.3
+class Rand
+{
+public:
+   Rand(uint64_t seed) : state(4101842887655102017LL)
+   {
+      state ^= seed;
+      state = uint64();
+   }
+
+   Rand() : Rand(get_urandom()) {}
+
+   uint64_t uint64()
+   {
+      state ^= state >> 21;
+      state ^= state << 35;
+      state ^= state >> 4;
+      return state * 2685821657736338717LL;
+   }
+
+   double uniform()
+   {
+      return (1.0 / numeric_limits<uint64_t>::max()) * uint64();
+   }
+
+private:
+   uint64_t state;
+};
+
+Rand rng;
 
 /**********  Fetch a URL, with caching.  **********/
 size_t write_callback(char *buffer, size_t size, size_t nmemb, void *user_data)
@@ -366,7 +433,7 @@ double game_prob(team_t first, team_t second, team_t winner, int round)
    double result = get_prob(winner, round) / (get_prob(first, round) + get_prob(second, round));
    if (isnan(result))
    {
-      cout << "first: " << first << ", second: " << second << ", winner: " << winner << ", round: " << round << endl;
+      cout << "first: " << (int)first << " " << teams[first].name << ", second: " << (int)second << " " << teams[second].name << ", winner: " << (int)winner << ", round: " << round << endl;
       cout << get_prob(winner, round) << endl;
       cout << get_prob(first, round) << endl;
       cout << get_prob(second, round) << endl;
@@ -1137,6 +1204,19 @@ string to_string(ResultSet result_set)
    return fmt::format("{:.3f}% ", result_set.prob * 100) BOOLEXPR(+to_string(result_set.which));
 }
 
+struct TeamInfo
+{
+   team_t team;
+   ResultSet result_set;
+};
+
+struct Row
+{
+   scoretuple_t scoretuple;
+   ResultSet result_set;
+   double cumsum_prob = 0;
+};
+
 struct Outcomes
 {
    team_t team;
@@ -1145,6 +1225,54 @@ struct Outcomes
    Outcomes(team_t team, scoretuple_t scores, ResultSet set) : team(team), result_sets{{scores, set}} {}
    Outcomes() : team(-1) {}
    Outcomes(team_t team) : team(team) {}
+
+   double total_prob() const
+   {
+      double total = 0;
+      for (const auto &[scoretuple, result_set] : result_sets)
+      {
+         total += result_set.prob;
+      }
+      return total;
+   }
+
+   vector<Row> get_rows(size_t monte_carlo_iters) const
+   {
+      double outcomes_prob = total_prob();
+      double row_prob = outcomes_prob / monte_carlo_iters;
+      vector<Row> rows;
+      double cumsum_prob = 0;
+      for (const auto &[scoretuple, result_set] : result_sets)
+      {
+         cumsum_prob += result_set.prob;
+         rows.push_back({scoretuple, result_set, cumsum_prob});
+         rows[rows.size() - 1].result_set.prob = row_prob;
+      }
+      myassert(fabs(outcomes_prob - rows[rows.size() - 1].cumsum_prob) < 1e-13);
+      return rows;
+   }
+
+   void update(const TeamInfo &winner, scoretuple_t this_scores, scoretuple_t total_scores, const ResultSet &result_set1, const ResultSet &result_set2)
+   {
+      ResultSet new_set;
+      if (winner.team < 0)
+      {
+#if WITH_BOOLEXPR
+         new_set.which = and_({result_set1.which, result_set2.which});
+#endif
+      }
+      else
+      {
+#if WITH_BOOLEXPR
+         new_set.which = and_({result_set1.which, result_set2.which, winner.result_set.which});
+#endif
+         total_scores += this_scores;
+      }
+      // This is where I do the "or" with existing results.;
+      ResultSet &rset = result_sets[normalize(total_scores)];
+      new_set.prob = winner.result_set.prob * result_set1.prob * result_set2.prob;
+      rset.combine_disjoint(new_set);
+   }
 };
 
 string to_string(const Outcomes &outcome)
@@ -1170,11 +1298,17 @@ Outcomes *find_team(vector<Outcomes> &outcomes, team_t team)
    return nullptr;
 }
 
-struct TeamInfo
+const Row &random_row(const vector<Row> &rows)
 {
-   team_t team;
-   ResultSet result_set;
-};
+   double myrand = rng.uniform() * rows[rows.size() - 1].cumsum_prob;
+
+   // First item where myrand <= item.cumsum_prob
+   auto iter = lower_bound(rows.begin(), rows.end(), myrand, [](const Row &row, double myrand)
+                           { return row.cumsum_prob < myrand; });
+   myassert(iter != rows.end());
+
+   return *iter;
+}
 
 // The first element of the vector is always for team "other".
 vector<Outcomes>
@@ -1226,13 +1360,21 @@ outcomes(
    int prev_match = input(match_index);
    const auto outcomes1 = outcomes(prev_match, all_selections[match_index]);
    const auto outcomes2 = outcomes(prev_match + 1, all_selections[match_index]);
+
+   size_t threshold_per_team_pairs = MONTE_CARLO_THRESHOLD / (double)(outcomes1.size() * outcomes2.size());
+
+   // auto start = high_resolution_clock::now();
+
    vector<Outcomes> result(1);
+
    /*
    if (ri.round <= 1)
    {
       cout << "About to loop, round " << ri.round << endl;
    }
    */
+
+   bool displayed_mc_warning = false;
 
    for (const Outcomes &outcome1 : outcomes1)
    {
@@ -1304,41 +1446,36 @@ outcomes(
                }
             }
 
-            for (const auto &score_and_prob1 : outcome1.result_sets)
+            auto this_scores = get_scoretuple(match_index, winner.team, this_points / 10);
+
+            if (outcome1.result_sets.size() * outcome2.result_sets.size() > threshold_per_team_pairs)
             {
-               for (const auto &score_and_prob2 : outcome2.result_sets)
+               if (!displayed_mc_warning)
                {
-                  scoretuple_t total_scores = score_and_prob1.first + score_and_prob2.first;
-                  scoretuple_t overall_scores;
-                  ResultSet new_set;
+                  cout << "Warning: Round " << round_names[ri.round] << " using Monte Carlo simulation, results approximate.\n";
+                  displayed_mc_warning = true;
+               }
+               double team_pair_prob = outcome1.total_prob() * outcome2.total_prob();
+               size_t monte_carlo_iters = max((size_t)(team_pair_prob * MONTE_CARLO_ITERS + 0.5), (size_t)1);
+               vector<Row> rows1 = outcome1.get_rows(monte_carlo_iters);
+               vector<Row> rows2 = outcome2.get_rows(1);
 
-                  if (winner.team < 0)
+               for (size_t i = 0; i < monte_carlo_iters; ++i)
+               {
+                  const Row &rand_row1 = random_row(rows1);
+                  const Row &rand_row2 = random_row(rows2);
+                  dest->update(winner, this_scores, rand_row1.scoretuple + rand_row2.scoretuple,
+                               rand_row1.result_set, rand_row2.result_set);
+               }
+            }
+            else
+            {
+               for (const auto &[scoretuple1, result_set1] : outcome1.result_sets)
+               {
+                  for (const auto &[scoretuple2, result_set2] : outcome2.result_sets)
                   {
-                     overall_scores = total_scores;
-#if WITH_BOOLEXPR
-                     new_set.which = and_({score_and_prob1.second.which, score_and_prob2.second.which});
-#endif
+                     dest->update(winner, this_scores, scoretuple1 + scoretuple2, result_set1, result_set2);
                   }
-                  else
-                  {
-#if WITH_BOOLEXPR
-                     new_set.which = and_({score_and_prob1.second.which, score_and_prob2.second.which, winner.result_set.which});
-#endif
-                     auto this_scores = get_scoretuple(match_index, winner.team, this_points / 10);
-                     overall_scores = total_scores + this_scores;
-                  }
-                  // This is where I do the "or" with existing results.;
-                  ResultSet &rset = dest->result_sets[normalize(overall_scores)];
-                  new_set.prob = winner.result_set.prob * score_and_prob1.second.prob * score_and_prob2.second.prob;
-                  /*
-                  if (rset.which)
-                  {
-                     cout << "Oring " << to_string(rset.which) << " *WITH* " << to_string(new_set.which) << "\n";
-                     cout << "  Got " << to_string(or_({rset.which, new_set.which})) << "\n";
-                  }
-                  */
-
-                  rset.combine_disjoint(new_set);
                }
             }
          }
@@ -1348,25 +1485,28 @@ outcomes(
    /*
    if (ri.round <= 1)
    {
-      cout << "loop done.\n";
+      cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
+      // cout << "loop done.\n";
    }
    */
    return result;
 }
 
-template <typename Clock>
-double elapsed(time_point<Clock> start, time_point<Clock> end)
+struct WinProb
 {
-   return duration_cast<microseconds>(end - start).count() / 1e6;
-}
+   int bracket;
+   ResultSet first_place;
+   ResultSet second_place;
+};
 
-vector<tuple<int, ResultSet, ResultSet>> get_win_probs(const vector<Outcomes> &outcomes)
+vector<WinProb>
+get_win_probs(const vector<Outcomes> &outcomes)
 {
-   vector<tuple<int, ResultSet, ResultSet>> win_probs(NUM_BRACKETS);
+   vector<WinProb> win_probs(NUM_BRACKETS);
 
    for (size_t i = 0; i < NUM_BRACKETS; ++i)
    {
-      get<0>(win_probs[i]) = i;
+      win_probs[i].bracket = i;
    }
 
    for (const Outcomes &outc : outcomes)
@@ -1374,8 +1514,8 @@ vector<tuple<int, ResultSet, ResultSet>> get_win_probs(const vector<Outcomes> &o
       for (const auto &score_and_result_sets : outc.result_sets)
       {
          auto [biggest_index, second_biggest_index] = winner(score_and_result_sets.first);
-         get<1>(win_probs[biggest_index]).combine_disjoint(score_and_result_sets.second);
-         get<2>(win_probs[second_biggest_index]).combine_disjoint(score_and_result_sets.second);
+         win_probs[biggest_index].first_place.combine_disjoint(score_and_result_sets.second);
+         win_probs[second_biggest_index].second_place.combine_disjoint(score_and_result_sets.second);
       }
    }
 
@@ -1390,7 +1530,7 @@ team_t must_win(game_t match_index, int bracket)
    matchup.winner = matchup.first_team;
    myassert(matchup.winner >= 0);
    auto win_probs = get_win_probs(outcomes(62, {}));
-   if (get<1>(win_probs[bracket]).prob == 0)
+   if (win_probs[bracket].first_place.prob == 0)
    {
       matchup.winner = original_winner;
       return matchup.second_team;
@@ -1399,7 +1539,7 @@ team_t must_win(game_t match_index, int bracket)
    matchup.winner = matchup.second_team;
    myassert(matchup.winner >= 0);
    win_probs = get_win_probs(outcomes(62, {}));
-   if (get<1>(win_probs[bracket]).prob == 0)
+   if (win_probs[bracket].first_place.prob == 0)
    {
       matchup.winner = original_winner;
       return matchup.first_team;
@@ -1628,6 +1768,7 @@ int main(int argc, char *argv[])
       }
    }
 #endif
+   // games[54].winner = games[54].first_team;  // Kansas vs Providence
 
    // games[53].winner = games[53].first_team; //  Michigan 11 wins (Villanova 2 loses)
 
@@ -1642,6 +1783,7 @@ int main(int argc, char *argv[])
    // games[49].winner = games[49].first_team; // Texas Tech 3 wins (Duke 2 loses)
    // games[52].winner = games[52].first_team; // Arizona 1 wins (Houston 5 loses)
 
+   vector<bool> bracket_eliminated(NUM_BRACKETS);
    {
       cout << "**********  Whole Thing!\n";
       // auto start = high_resolution_clock::now();
@@ -1665,18 +1807,24 @@ int main(int argc, char *argv[])
       auto win_probs = get_win_probs(results);
 
       sort(win_probs.begin(), win_probs.end(), [](auto &a, auto &b)
-           { return get<1>(a).prob == get<1>(b).prob ? get<2>(a).prob > get<2>(b).prob : get<1>(a).prob > get<1>(b).prob; });
+           { return a.first_place.prob != b.first_place.prob ? a.first_place.prob > b.first_place.prob : a.second_place.prob != b.second_place.prob ? a.second_place.prob > b.second_place.prob
+                                                                                                                                                    : a.bracket < b.bracket; });
 
       cout << "***** Probability of Win & 2nd place for each Bracket *****\n";
       for (int i = 0; i < NUM_BRACKETS; ++i)
       {
-         cout << fmt::format("{:<22}: {:5.2f}% {:5.2f}%", brackets[get<0>(win_probs[i])].name, get<1>(win_probs[i]).prob * 100, get<2>(win_probs[i]).prob * 100)
+         int bracket_num = win_probs[i].bracket;
+         cout << fmt::format("{:<22}: {:5.2f}% {:5.2f}%", brackets[bracket_num].name, win_probs[i].first_place.prob * 100, win_probs[i].second_place.prob * 100)
 #if WITH_BOOLEXPR
-              << (get<1>(win_probs[i]).which)->sexpr(0)
+              << (win_probs[i].first_place.which)->sexpr(0)
 #endif
               << "\n";
+
+         bracket_eliminated[bracket_num] = win_probs[i].first_place.prob == 0;
       }
    }
+
+   return 0;
 
    struct AlternateWinProb
    {
@@ -1686,41 +1834,43 @@ int main(int argc, char *argv[])
       double prob;
    };
 
-   vector<game_t> matches_to_consider{50, 51, 54, 55};
+   vector<game_t> matches_to_consider{56, 57, 58, 59};
    // vector<game_t> matches_to_consider{48, 49, 50, 51, 52, 53, 54, 55};
 
-   /*
-   int bracket_to_consider = 3;
+   int bracket_to_consider = 1;
    cout << "**********  " << brackets[bracket_to_consider].name << "  **********\n";
-      vector<AlternateWinProb> alternate_win_probs;
-      for (game_t match_index : matches_to_consider)
-      {
-         Matchup &matchup = games[match_index];
-         auto original_winner = matchup.winner;
+   vector<AlternateWinProb> alternate_win_probs;
+   for (game_t match_index : matches_to_consider)
+   {
+      Matchup &matchup = games[match_index];
+      auto original_winner = matchup.winner;
 
-         matchup.winner = matchup.first_team;
-         auto results = outcomes(62, {});
-         auto win_probs = get_win_probs(results);
-         alternate_win_probs.push_back({match_index, true, matchup.winner, win_probs[bracket_to_consider].second.prob});
+      matchup.winner = matchup.first_team;
+      auto results = outcomes(62, {});
+      auto win_probs = get_win_probs(results);
+      alternate_win_probs.push_back({match_index, true, matchup.winner, win_probs[bracket_to_consider].first_place.prob});
 
-         matchup.winner = matchup.second_team;
-         results = outcomes(62, {});
-         win_probs = get_win_probs(results);
-         alternate_win_probs.push_back({match_index, false, matchup.winner, win_probs[bracket_to_consider].second.prob});
+      matchup.winner = matchup.second_team;
+      results = outcomes(62, {});
+      win_probs = get_win_probs(results);
+      alternate_win_probs.push_back({match_index, false, matchup.winner, win_probs[bracket_to_consider].first_place.prob});
 
-         matchup.winner = original_winner;
-      }
-      sort(alternate_win_probs.begin(), alternate_win_probs.end(), [](auto &a, auto &b)
-           { return a.prob > b.prob; });
+      matchup.winner = original_winner;
+   }
+   sort(alternate_win_probs.begin(), alternate_win_probs.end(), [](auto &a, auto &b)
+        { return a.prob > b.prob; });
 
-      for (const auto alt : alternate_win_probs)
-      {
-         cout << fmt::format("{:5.2f}% {} ({} {})\n", alt.prob * 100, teams[alt.winning_team].name, alt.match, alt.first ? "first" : "second");
-      }
-      */
+   for (const auto alt : alternate_win_probs)
+   {
+      cout << fmt::format("{:5.2f}% {} ({} {})\n", alt.prob * 100, teams[alt.winning_team].name, alt.match, alt.first ? "first" : "second");
+   }
 
    for (int bracket_to_consider = 0; bracket_to_consider < NUM_BRACKETS; ++bracket_to_consider)
    {
+      if (bracket_eliminated[bracket_to_consider])
+      {
+         continue;
+      }
       cout << "**********  " << brackets[bracket_to_consider].name << "  **********\n";
       alternatives(bracket_to_consider, matches_to_consider);
    }
