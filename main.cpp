@@ -3,7 +3,7 @@
 // brew install curl nlohmann-json fmt
 // Use "brew --prefix <package>" to find where they're installed.  For me:
 //
-// clang++ -std=gnu++20 -O3 -DNDEBUG -Wall -Werror
+// clang++ -std=gnu++20 -O3 -Wall -Werror
 // -I/opt/homebrew/opt/fmt/include -L/opt/homebrew/opt/fmt/lib
 // -I/opt/homebrew/opt/curl/include -L/opt/homebrew/opt/curl/lib
 // -I/opt/homebrew/opt/nlohmann-json/include -lcurl -lfmt main.cpp && time
@@ -123,6 +123,7 @@ array<uint64_t, NUM_BRACKETS> entries{
 
 /**********  Utilities: asserts and random number generator  **********/
 
+// We should get rid of myassert() and just use the built in assert.
 void assert_failed(const char *expr)
 {
    fprintf(stderr, "Assertion failed: %s\n", expr);
@@ -141,6 +142,11 @@ vector<string> split(string source, char delim)
       result.push_back(item);
    }
    return result;
+}
+
+time_point<high_resolution_clock> now()
+{
+   return high_resolution_clock::now();
 }
 
 template <typename Clock>
@@ -1222,39 +1228,56 @@ struct Outcomes
    team_t team;
    unordered_map<scoretuple_t, ResultSet> result_sets;
 
-   Outcomes(team_t team, scoretuple_t scores, ResultSet set) : team(team), result_sets{{scores, set}} {}
+private:
+   // total_prob_ is only used during Monte Carlo.
+   double total_prob_ = 0;
+   mutable bool frozen_ = false;
+   mutable vector<Row> rows_;
+
+public:
+   Outcomes(team_t team, scoretuple_t scores, ResultSet set) : team(team), result_sets{{scores, set}}, total_prob_(set.prob) {}
    Outcomes() : team(-1) {}
    Outcomes(team_t team) : team(team) {}
 
    double total_prob() const
    {
-      double total = 0;
-      for (const auto &[scoretuple, result_set] : result_sets)
-      {
-         total += result_set.prob;
-      }
-      return total;
+      return total_prob_;
    }
 
-   vector<Row> get_rows(size_t monte_carlo_iters) const
+   void increment_total_prob(double amount)
    {
-      double outcomes_prob = total_prob();
-      double row_prob = outcomes_prob / monte_carlo_iters;
-      vector<Row> rows;
-      double cumsum_prob = 0;
-      for (const auto &[scoretuple, result_set] : result_sets)
+      myassert(!frozen_);
+      if (amount + total_prob_ > 1.0000001)
       {
-         cumsum_prob += result_set.prob;
-         rows.push_back({scoretuple, result_set, cumsum_prob});
-         rows[rows.size() - 1].result_set.prob = row_prob;
+         cout << "total_prob_: " << total_prob_ << ", increment: " << amount << endl;
       }
-      myassert(fabs(outcomes_prob - rows[rows.size() - 1].cumsum_prob) < 1e-13);
-      return rows;
+      assert(amount + total_prob_ < 1.0000001);
+      total_prob_ += amount;
    }
 
-   void update(const TeamInfo &winner, scoretuple_t this_scores, scoretuple_t total_scores, const ResultSet &result_set1, const ResultSet &result_set2)
+   const vector<Row> &get_rows() const
    {
+      if (!frozen_)
+      {
+         double cumsum_prob = 0;
+         for (const auto &[scoretuple, result_set] : result_sets)
+         {
+            cumsum_prob += result_set.prob;
+            rows_.push_back({scoretuple, result_set, cumsum_prob});
+            rows_[rows_.size() - 1].result_set.prob = -1;
+         }
+         myassert(fabs(total_prob() - rows_[rows_.size() - 1].cumsum_prob) < 1e-13);
+         frozen_ = true;
+      }
+      return rows_;
+   }
+
+   void update(const TeamInfo &winner, scoretuple_t this_scores, scoretuple_t total_scores, const ResultSet &result_set1, const ResultSet &result_set2,
+               double probability)
+   {
+      assert(!frozen_);
       ResultSet new_set;
+
       if (winner.team < 0)
       {
 #if WITH_BOOLEXPR
@@ -1270,7 +1293,7 @@ struct Outcomes
       }
       // This is where I do the "or" with existing results.;
       ResultSet &rset = result_sets[normalize(total_scores)];
-      new_set.prob = winner.result_set.prob * result_set1.prob * result_set2.prob;
+      new_set.prob = winner.result_set.prob * probability;
       rset.combine_disjoint(new_set);
    }
 };
@@ -1363,18 +1386,18 @@ outcomes(
 
    size_t threshold_per_team_pairs = MONTE_CARLO_THRESHOLD / (double)(outcomes1.size() * outcomes2.size());
 
-   // auto start = high_resolution_clock::now();
+   auto start = now();
 
    vector<Outcomes> result(1);
 
-   /*
    if (ri.round <= 1)
    {
       cout << "About to loop, round " << ri.round << endl;
    }
-   */
 
    bool displayed_mc_warning = false;
+   double rows_elapsed = 0;
+   double mc_iters_elapsed = 0;
 
    for (const Outcomes &outcome1 : outcomes1)
    {
@@ -1383,14 +1406,7 @@ outcomes(
          continue;
       }
       myassert(outcome1.team >= 0);
-      /*
-      if (ri.round == 0)
-      {
-         */
-      // cout << (outcome1.team < 0 ? "other" : teams[outcome1.team].name) << endl;
-      /*
-   }
-   */
+
       for (const Outcomes &outcome2 : outcomes2)
       {
          if (outcome2.result_sets.empty())
@@ -1398,14 +1414,6 @@ outcomes(
             continue;
          }
          myassert(outcome2.team >= 0);
-
-         /*
-         if (ri.round == 0)
-         {*/
-         // cout << "    " << (outcome2.team < 0 ? "other" : teams[outcome2.team].name) << endl;
-         /*
-      }
-      */
 
          vector<TeamInfo> teams_with_probs;
          if (game.winner >= 0)
@@ -1446,6 +1454,8 @@ outcomes(
                }
             }
 
+            dest->increment_total_prob(winner.result_set.prob * outcome1.total_prob() * outcome2.total_prob());
+
             auto this_scores = get_scoretuple(match_index, winner.team, this_points / 10);
 
             if (outcome1.result_sets.size() * outcome2.result_sets.size() > threshold_per_team_pairs)
@@ -1457,16 +1467,22 @@ outcomes(
                }
                double team_pair_prob = outcome1.total_prob() * outcome2.total_prob();
                size_t monte_carlo_iters = max((size_t)(team_pair_prob * MONTE_CARLO_ITERS + 0.5), (size_t)1);
-               vector<Row> rows1 = outcome1.get_rows(monte_carlo_iters);
-               vector<Row> rows2 = outcome2.get_rows(1);
 
+               auto rows_start = now();
+               const vector<Row> &rows1 = outcome1.get_rows();
+               const vector<Row> &rows2 = outcome2.get_rows();
+               rows_elapsed += elapsed(rows_start, now());
+
+               auto mc_iters_start = now();
                for (size_t i = 0; i < monte_carlo_iters; ++i)
                {
                   const Row &rand_row1 = random_row(rows1);
                   const Row &rand_row2 = random_row(rows2);
                   dest->update(winner, this_scores, rand_row1.scoretuple + rand_row2.scoretuple,
-                               rand_row1.result_set, rand_row2.result_set);
+                               rand_row1.result_set, rand_row2.result_set,
+                               team_pair_prob / monte_carlo_iters);
                }
+               mc_iters_elapsed += elapsed(mc_iters_start, now());
             }
             else
             {
@@ -1474,7 +1490,8 @@ outcomes(
                {
                   for (const auto &[scoretuple2, result_set2] : outcome2.result_sets)
                   {
-                     dest->update(winner, this_scores, scoretuple1 + scoretuple2, result_set1, result_set2);
+                     dest->update(winner, this_scores, scoretuple1 + scoretuple2, result_set1, result_set2,
+                                  result_set1.prob * result_set2.prob);
                   }
                }
             }
@@ -1482,13 +1499,15 @@ outcomes(
       }
    }
 
-   /*
    if (ri.round <= 1)
    {
-      cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
-      // cout << "loop done.\n";
+      cout << "Elapsed " << elapsed(start, now()) << " sec.\n";
+      if (rows_elapsed > 0)
+      {
+         cout << "get_rows: " << rows_elapsed << " sec, Monte Carlo iters: " << mc_iters_elapsed << " sec\n";
+      }
    }
-   */
+
    return result;
 }
 
@@ -1786,9 +1805,9 @@ int main(int argc, char *argv[])
    vector<bool> bracket_eliminated(NUM_BRACKETS);
    {
       cout << "**********  Whole Thing!\n";
-      // auto start = high_resolution_clock::now();
+      auto start = now();
       auto results = outcomes(62, {});
-      // cout << "Elapsed " << elapsed(start, high_resolution_clock::now()) << " sec.\n";
+      cout << "Whole thing elapsed " << elapsed(start, now()) << " sec.\n";
 
       /*
       for (const auto &outcome : results)
