@@ -9,6 +9,49 @@
 // -I/opt/homebrew/opt/nlohmann-json/include -lcurl -lfmt main.cpp && time
 // ./a.out
 
+// **********  TODO next year (2023)  **********
+//
+// Optimizing: start with 538's choices, get single & double optimzing working.
+// Then implement the "all 2^n combinations downstream from a given choice"
+// optimizing.
+
+// Write  blog post: you root for your team, but even if they win it may not
+// help if others chose the same thing.  Figure out probability of winning and
+// paths of glory.  Doesn't scale to round of 32 or round of 64.  But you don't
+// need full 2^n.  Instead, you need score tuples & winner.  That gets you to
+// round of 32.  Round of 64 is just two independent Round of 32s, with a
+// championship.  So can do Monte Carlo for the championship but exact before
+// that.  Less variance, and therefore should require fewer Monte Carlo
+// iterations and be overall faster.
+
+// Paths of glory: The boolean stuff turned out to be a bust.  Automate choosing
+// matches_to_consider, see the TODO comment above it.  Could also look more
+// games in the future, i.e. not just "must win" games in the next round, but
+// also the round after that.  Paths of Glory are probably too complicated until
+// at least the round of 32 is over.
+
+// **********  Notes from optimizing  **********
+// In 2022: Best bracket I could find just choose most likely winner for round
+// of 64 and round of 32, i.e. just what 538 predicted, never needed to look at
+// other brackets in my group.
+//
+// You won't find the best by just hill climbing with single changes:
+// considering all pairs of changes produced a slightly better result than just
+// only considering single flips.  However, the improvement just meant winning
+// one more year every century.
+//
+// One strategy perhaps worth trying: when you consider a change, also consider
+// all games downstream of it.  So when you consider flipping a Sweet 16 choice,
+// evaluate all combinations of flipping Elite 8, Final 4 and championship.
+// That's 8 possibilities per Sweet 16 choice.  If we did that for all Sweet 16
+// single flips, that's only 8 * 8 = 64 simulations, same as single_optimize().
+// Might be better use of limited simulations than double_optimize().
+//
+// If you try it at Round of 64, that's 32 * 32 = 1024, still faster than
+// double_optimize(), which took almost 3 hours on Crystal (Ubuntu).
+
+// **********  Other Notes  **********
+
 // NOTE: Match, matchup and game are used interchangeably in this code.  Should
 // probably standardize on match.  Oh well.
 
@@ -110,28 +153,21 @@ using json = nlohmann::json;
 
 constexpr size_t NUM_BRACKETS = 8;
 
+// Summary: lots of Villanova fans.  In 2022, optimizer chose Villanova to make
+// it to the championship.
 array<uint64_t, NUM_BRACKETS> entries{
     60122219, // me, Hoops, There It Is! (Martin, martinisquared)
-    62328104, // Tara, TheGambler46
-    58407997, // Dan (Dan Murphy, dmurph888)
-    58468455, // Eileen-er-iffic (Eileen (Dan's Sister), The_MRF_NYC)
-    61439241, // Vakidis (Billy (Maureen's Husband), wgarbarini)
-    62484411, // Owe'n Charlie '22 (Uncle Dennis, tiger72pu)
-    65481077, // Maureen's Annual Bonus (Joe (Eileen's Husband), gettinpiggywitit)
-    69629125, // RPcatsmounts! espn88461517 (Ryan Price, Dan's step brother)
+    62328104, // Tara, TheGambler46.  Mostly 538 with a few tweaks.
+    58407997, // Dan (Dan Murphy, dmurph888).  2MW Auburn to win, 3E Purdue over 2E Kentucky for Final 4.  2S Villanova over 1S Arizona.
+    58468455, // Eileen-er-iffic (Eileen (Dan's Sister), The_MRF_NYC) 3E Purdue to win.  4MW Providence over 1 MW Kansas.
+    61439241, // Vakidis (Billy (Maureen's Husband), wgarbarini) 3E Purdue over 2E Kentucky. 2S Villanova over 1S Arizona.  5MW Iowa over 1MW Kansas.  2S Villanova over 1MW Kansas to make it to championship.
+    62484411, // Owe'n Charlie '22 (Uncle Dennis, tiger72pu).  2S Villanova over 1S Arizona.
+    65481077, // Maureen's Annual Bonus (Joe (Eileen's Husband), gettinpiggywitit) 1S Arizona to win.  Sweet 16: 3S Tennessee over 2S Villanova.  3MW Wisconsin over 2MW Auburn.
+    69629125, // RPcatsmounts! espn88461517 (Ryan Price, Dan's step brother).  1MW Kansas to win. 3E Purdue over 2E Kentucky. 3S Tennessee over 1S Arizona.
               // 61783453,  # Villa-Mo-va 1 (Maureen (Dan's Sister), Villa-Mo-va)
 };
 
 /**********  Utilities: asserts and random number generator  **********/
-
-// We should get rid of myassert() and just use the built in assert.
-void assert_failed(const char *expr)
-{
-   fprintf(stderr, "Assertion failed: %s\n", expr);
-   abort();
-}
-
-#define myassert(expr) ((expr) ? (void)0 : assert_failed(#expr))
 
 vector<string> split(string source, char delim)
 {
@@ -432,10 +468,10 @@ double get_prob(team_t team_index, int round)
 
 double game_prob(team_t first, team_t second, team_t winner, int round)
 {
-   myassert(winner >= 0);
-   myassert(first >= 0);
-   myassert(second >= 0);
-   myassert(winner == first || winner == second);
+   assert(winner >= 0);
+   assert(first >= 0);
+   assert(second >= 0);
+   assert(winner == first || winner == second);
 
    double result = get_prob(winner, round) / (get_prob(first, round) + get_prob(second, round));
    if (isnan(result))
@@ -445,7 +481,7 @@ double game_prob(team_t first, team_t second, team_t winner, int round)
       cout << get_prob(first, round) << endl;
       cout << get_prob(second, round) << endl;
    }
-   myassert(!isnan(result));
+   assert(!isnan(result));
    return result;
 }
 
@@ -470,7 +506,7 @@ json get_json(const string &var, const string &source)
    string raw = mymatch[1].str();
    if (raw[0] == '\'')
    {
-      myassert(raw[raw.size() - 1] == '\'');
+      assert(raw[raw.size() - 1] == '\'');
       raw[0] = '"';
       raw[raw.size() - 1] = '"';
    }
@@ -489,7 +525,7 @@ struct Round
 
 inline Round round_index(int match)
 {
-   myassert(1 <= match && match <= NUM_GAMES);
+   assert(1 <= match && match <= NUM_GAMES);
    // For x > 0, bit_width(x) == 1 + floor(log2(x)).
    int round = bit_width((uint8_t)(64 - match)) - 1;
    int num_matches = (1 << round);
@@ -644,12 +680,12 @@ Matchup parse_matchup(const json &matchup)
    if (match_teams.size() >= 1)
    {
       result.first_team = match_teams[0]["id"].get<int>() - 65;
-      myassert(teams[result.first_team].name == match_teams[0]["n"]);
+      assert(teams[result.first_team].name == match_teams[0]["n"]);
    }
    if (match_teams.size() >= 2)
    {
       result.second_team = match_teams[1]["id"].get<int>() - 65;
-      myassert(teams[result.second_team].name == match_teams[1]["n"]);
+      assert(teams[result.second_team].name == match_teams[1]["n"]);
    }
    if (matchup.find("w") != matchup.end())
    {
@@ -683,10 +719,10 @@ string to_string(const Bracket &bracket)
    return result;
 }
 
-Bracket make_bracket(const array<bool, NUM_GAMES> &who_wins)
+Bracket make_bracket(const array<bool, NUM_GAMES> &who_wins, string name = "Experiment")
 {
    Bracket bracket;
-   bracket.name = "Experiment";
+   bracket.name = name;
    for (game_t match = 0; match < NUM_GAMES; ++match)
    {
       if (match < 32)
@@ -701,6 +737,47 @@ Bracket make_bracket(const array<bool, NUM_GAMES> &who_wins)
    }
 
    return bracket;
+}
+
+// In 2022, chance of winning whole thing was 21.53%.
+pair<Bracket, array<bool, NUM_GAMES>> make_most_likely_bracket()
+{
+   Bracket bracket;
+   bracket.name = "Most Likely";
+   array<bool, NUM_GAMES> choices;
+
+   for (game_t match = 0; match < NUM_GAMES; ++match)
+   {
+      int round = round_index(match + 1).round;
+      team_t first_team;
+      team_t second_team;
+      if (match < 32)
+      {
+         first_team = games[match].first_team;
+         second_team = games[match].second_team;
+      }
+      else
+      {
+         int prev = input(match);
+         first_team = bracket.picks[prev];
+         second_team = bracket.picks[prev + 1];
+      }
+      // So this is not actually the criteria we want to use, since it's
+      // conditional on previous choices being correct.  What we want is the
+      // overall probability of both getting to this round & winning it, which
+      // is what 538 and Ken Pomeroy have in their raw numbers.
+      //
+      // Note that this actually happened in 2022 in the Sweet 16, for Duke vs
+      // Texas Tech.  Texas Tech was the stronger team, but was less likely to
+      // get to the Sweet 16, and thus less likely to win the Sweet 16 overall
+      // than Duke.  This code chose Sweet 16, but the first single_optimize()
+      // fixed it up.
+      double first_prob = game_prob(first_team, second_team, first_team, round);
+      choices[match] = first_prob >= 0.5;
+      bracket.picks.push_back(first_prob >= 0.5 ? first_team : second_team);
+   }
+
+   return make_pair(bracket, choices);
 }
 
 vector<bitset<NUM_TEAMS>> all_selections(NUM_GAMES);
@@ -744,7 +821,7 @@ Bracket get_bracket(uint64_t entry)
    {
       result.picks.push_back(stoi(pick_str) - 1);
    }
-   myassert(result.picks.size() == NUM_GAMES);
+   assert(result.picks.size() == NUM_GAMES);
 
    return result;
 }
@@ -1037,7 +1114,7 @@ shared_ptr<BoolExpr> special_helper(const unordered_set<shared_ptr<BoolExpr>> &s
                               new_dual_children.insert(*dual_child_iter);
                            }
                         }
-                        myassert(new_dual_children.size() >= 1);
+                        assert(new_dual_children.size() >= 1);
                         if (new_dual_children.size() == 1)
                         {
                            raised_node = true;
@@ -1291,7 +1368,7 @@ public:
 
    void increment_total_prob(double amount)
    {
-      myassert(!frozen_);
+      assert(!frozen_);
       if (amount + total_prob_ > 1.0000001)
       {
          cout << "total_prob_: " << total_prob_ << ", increment: " << amount << endl;
@@ -1377,7 +1454,7 @@ const Row &random_row(const vector<Row> &rows)
    // First item where myrand <= item.cumsum_prob
    auto iter = lower_bound(rows.begin(), rows.end(), myrand, [](const Row &row, double myrand)
                            { return row.cumsum_prob < myrand; });
-   myassert(iter != rows.end());
+   assert(iter != rows.end());
 
    return *iter;
 }
@@ -1394,7 +1471,7 @@ outcomes(
    if (ri.round == NUM_ROUNDS - 1)
    {
       // Base case, round of 64.
-      myassert(this_points == 10);
+      assert(this_points == 10);
       vector<Outcomes> result(1);
       vector<TeamInfo> teams_with_probs;
       if (game.winner >= 0)
@@ -1403,8 +1480,8 @@ outcomes(
       }
       else
       {
-         myassert(game.first_team >= 0);
-         myassert(game.second_team >= 0);
+         assert(game.first_team >= 0);
+         assert(game.second_team >= 0);
          double prob_first = game_prob(game.first_team, game.second_team, game.first_team, ri.round);
          teams_with_probs.push_back({game.first_team, {prob_first BOOLEXPR(COMMA Var::all_vars[game.id].first)}});
          teams_with_probs.push_back({game.second_team, {1.0 - prob_first BOOLEXPR(COMMA Var::all_vars[game.id].second)}});
@@ -1413,7 +1490,7 @@ outcomes(
       for (const TeamInfo &team_with_prob : teams_with_probs)
       {
          auto scores = get_scoretuple(match_index, team_with_prob.team, this_points / 10);
-         myassert(team_with_prob.team >= 0);
+         assert(team_with_prob.team >= 0);
 
          if (true /* selections[team_with_prob.team] */)
          {
@@ -1456,7 +1533,7 @@ outcomes(
       {
          continue;
       }
-      myassert(outcome1.team >= 0);
+      assert(outcome1.team >= 0);
 
       for (const Outcomes &outcome2 : outcomes2)
       {
@@ -1464,7 +1541,7 @@ outcomes(
          {
             continue;
          }
-         myassert(outcome2.team >= 0);
+         assert(outcome2.team >= 0);
 
          vector<TeamInfo> teams_with_probs;
          if (game.winner >= 0)
@@ -1472,9 +1549,9 @@ outcomes(
             // If this game has been played in real life, then all previous games
             // have also been played, so our recursive outcomes had better have
             // only a single non-empty result.
-            myassert(outcomes1.size() == 1 || (outcomes1.size() == 2 && outcomes1[0].result_sets.empty()));
-            myassert(outcomes2.size() == 1 || (outcomes2.size() == 2 && outcomes2[0].result_sets.empty()));
-            myassert(game.winner == outcome1.team || game.winner == outcome2.team);
+            assert(outcomes1.size() == 1 || (outcomes1.size() == 2 && outcomes1[0].result_sets.empty()));
+            assert(outcomes2.size() == 1 || (outcomes2.size() == 2 && outcomes2[0].result_sets.empty()));
+            assert(game.winner == outcome1.team || game.winner == outcome2.team);
             teams_with_probs.push_back({game.winner, {1.0 BOOLEXPR(COMMA{})}});
          }
          else
@@ -1488,7 +1565,7 @@ outcomes(
          // Since the scores will be exactly the same either way?
          for (const auto &winner : teams_with_probs)
          {
-            myassert(winner.team >= 0);
+            assert(winner.team >= 0);
             // Find the destination spot in result
             Outcomes *dest;
             if (false /* winner < 0 || !selections[winner] */)
@@ -1600,7 +1677,7 @@ team_t must_win(game_t match_index, int bracket)
    auto original_winner = matchup.winner;
 
    matchup.winner = matchup.first_team;
-   myassert(matchup.winner >= 0);
+   assert(matchup.winner >= 0);
    auto win_probs = get_win_probs(outcomes(62, {}));
    if (win_probs[bracket].first_place.prob == 0)
    {
@@ -1609,7 +1686,7 @@ team_t must_win(game_t match_index, int bracket)
    }
 
    matchup.winner = matchup.second_team;
-   myassert(matchup.winner >= 0);
+   assert(matchup.winner >= 0);
    win_probs = get_win_probs(outcomes(62, {}));
    if (win_probs[bracket].first_place.prob == 0)
    {
@@ -1646,7 +1723,7 @@ void alternatives(int bracket_to_consider, const vector<team_t> &matches_to_cons
       auto original_winner = matchup.winner;
 
       matchup.winner = matchup.first_team;
-      myassert(matchup.winner >= 0);
+      assert(matchup.winner >= 0);
       for (size_t j = i + 1; j < matches_to_consider.size(); j++)
       {
          team_t second_match_index = matches_to_consider[j];
@@ -1663,7 +1740,7 @@ void alternatives(int bracket_to_consider, const vector<team_t> &matches_to_cons
       }
 
       matchup.winner = matchup.second_team;
-      myassert(matchup.winner >= 0);
+      assert(matchup.winner >= 0);
       for (size_t j = i + 1; j < matches_to_consider.size(); j++)
       {
          team_t second_match_index = matches_to_consider[j];
@@ -1684,6 +1761,10 @@ void alternatives(int bracket_to_consider, const vector<team_t> &matches_to_cons
 
 /**********  Probablity of winning  **********/
 
+// 25.09% chance of success.
+array<bool, NUM_GAMES> best_choices_2022{true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, true, false, false, false, true, true, false, false, true, true, false, false, true, true, true, false, true, false, false, false, true, false, false, true, true, true, true};
+
+/*
 array<bool, NUM_GAMES> best_choices_2022{true, false, true, true, true, true, true,
                                          true, true, true, true, true, true, true, true,
                                          true, true, false, true, true, false, true,
@@ -1693,6 +1774,7 @@ array<bool, NUM_GAMES> best_choices_2022{true, false, true, true, true, true, tr
                                          false, true, true, false, false, true, false,
                                          false, false, true, true, false, false, true,
                                          false, true, true, true, true, true};
+*/
 
 double prob_win(const array<bool, NUM_GAMES> &choices, int entry)
 {
@@ -1769,10 +1851,20 @@ string to_string(const array<bool, NUM_GAMES> &choices)
 
 void compare(const Bracket &bracket1, const Bracket &bracket2)
 {
-   cout << fmt::format("    {:<20} {}\n", bracket1.name, bracket2.name);
-   cout << fmt::format("     --------------- --------------\n");
+   cout << fmt::format("\n     {:<20} {}\n", bracket1.name, bracket2.name);
+   cout << fmt::format("     ---------------      --------------\n");
    for (game_t match = 0; match < NUM_GAMES; ++match)
    {
+      auto iter = INDEX_TO_NAME.find(match);
+      if (iter != INDEX_TO_NAME.end())
+      {
+         cout << iter->second << "\n";
+      }
+      cout << fmt::format("{} {:<2} {:<20} {}\n",
+                          bracket1.picks[match] == bracket2.picks[match] ? " " : "*",
+                          match,
+                          teams[bracket1.picks[match]].name,
+                          teams[bracket2.picks[match]].name);
    }
 }
 
@@ -1782,7 +1874,7 @@ int main(int argc, char *argv[])
 {
    string html = get_entry(entries[0]);
    const auto teams_json = get_json("espn.fantasy.maxpart.config.scoreboard_teams", html);
-   myassert(teams_json.size() == NUM_TEAMS);
+   assert(teams_json.size() == NUM_TEAMS);
    for (const auto &team : teams_json)
    {
       int id = team["id"].get<int>() - 1;
@@ -1793,7 +1885,7 @@ int main(int argc, char *argv[])
 
    const auto matchups_json = get_json("espn.fantasy.maxpart.config.scoreboard_matchups", html);
 
-   myassert(matchups_json.size() == NUM_GAMES);
+   assert(matchups_json.size() == NUM_GAMES);
    for (const auto &matchup : matchups_json)
    {
       Matchup m = parse_matchup(matchup);
@@ -1817,11 +1909,11 @@ int main(int argc, char *argv[])
 
    // brackets[0] = make_bracket(best_choices_2022);
 
-   myassert(brackets.size() == NUM_BRACKETS);
+   assert(brackets.size() == NUM_BRACKETS);
 
    make_all_selections();
 
-   myassert(all_selections.size() == NUM_GAMES);
+   assert(all_selections.size() == NUM_GAMES);
 
    parse_probs();
 
@@ -1834,6 +1926,9 @@ int main(int argc, char *argv[])
    cout << "   " << teams[games[input(58)].first_team].name << ", " << teams[games[input(58)].second_team].name << "\n";
    cout << "Game 61 input: " << input(61) << "\n";
    */
+
+   compare(brackets[6], make_most_likely_bracket().first);
+   compare(brackets[7], make_most_likely_bracket().first);
 
 #if 0
    {
@@ -1973,9 +2068,9 @@ int main(int argc, char *argv[])
    // 16.
    // No single flips, even at 50M Monte Carlo iterations.
 
-   // This is the best after testing all single flip optimizations.  It has
-   // Arizona going to championship, against Gonzaga. 24.24% chance of winning.
    /*
+   // This is the best after testing all single flip optimizations.  It has
+   // Arizona going to championship, against Gonzaga.  24.24% chance of winning.
    array<bool, NUM_GAMES> single_choices{true, false, true, true, true, true, true,
                                          true, true, true, true, true, true, true, true,
                                          true, true, false, true, true, false, true,
@@ -1985,9 +2080,10 @@ int main(int argc, char *argv[])
                                          false, true, true, false, false, true, false,
                                          false, false, true, true, false, false, true,
                                          false, true, true, true, true, true};
-                                         */
-   // This is the best after testing all double flips.  It has Villanova going
-   // to the championship, against Gonzaga.  24.88%
+
+   // This is the best after testing all double flips.  It chooses Villanova
+   // over Tennessee in the Sweet 16, and Villanova over Arizona in Elite 8.
+   // Villanova then goes against Gonzaga in the championship.  24.88%
    array<bool, NUM_GAMES> double_choices{true, false, true, true, true, true, true,
                                          true, true, true, true, true, true, true, true,
                                          true, true, false, true, true, false, true,
@@ -1997,12 +2093,29 @@ int main(int argc, char *argv[])
                                          false, true, true, false, false, true, false,
                                          false, false, true, false, false, false, true, // <- change in this line
                                          false, false, true, true, true, true};         // <- change in this line.
-   cout << "**********  Optimizer!  **********\n";
-   cout << to_string(make_bracket(double_choices));
+   */
 
-   double best_p = prob_win(double_choices, entry_to_optimize);
+   // 25.09%.  So only helps over choosing the most likely (21.53%) once every 28 years.
+   // No single or double flip will improve it, i.e. single_optimize() and double_optimze() don't change it.
+   array<bool, NUM_GAMES> even_better{true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, true, false, false, false, true, true, false, false, true, true, false, false, true, true, true, false, true, false, false, false, true, false, false, true, true, true, true};
+
+   /*
+   array<bool, NUM_GAMES> single_from_most_likely{true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, true, false, false, false, true, true, false, false, true, true, false, false, true, false, false, false, true, true, true, false, true, false, true, true, true, false, true};
+   // compare(make_bracket(single_choices, "Single Optimized"), make_bracket(double_choices, "Double Optimized"));
+   // compare(make_bracket(single_choices, "Single Optimized"), make_most_likely_bracket());
+   // compare(make_bracket(double_choices, "Double Optimized"), make_most_likely_bracket());
+   */
+
+   compare(make_bracket(even_better, "Best so far"), make_most_likely_bracket().first);
+
+   cout << "**********  Optimizer!  **********\n";
+   array<bool, NUM_GAMES> to_optimize = make_most_likely_bracket().second;
+   cout << to_string(make_bracket(to_optimize));
+
+   double best_p = prob_win(to_optimize, entry_to_optimize);
    cout << "+++++ Baseline probability: " << best_p * 100 << "% +++++\n";
-   auto [best_choices, best_prob] = double_optimize(double_choices, best_p, entry_to_optimize);
+   auto [best_choices, best_prob] = single_optimize(to_optimize, best_p, entry_to_optimize, 48);
+   // auto [best_choices, best_prob] = double_optimize(to_optimize, best_p, entry_to_optimize);
 
    cout << to_string(make_bracket(best_choices));
    cout << "array<bool, NUM_GAMES> who_wins ";
