@@ -56,6 +56,7 @@
 //
 // On question to look at: in the next round, which outcome changes my chance of
 // winning the most?  Which pair or triple of outcomes?
+
 #include <cstdlib>
 #include <vector>
 #include <iostream>
@@ -99,7 +100,7 @@ constexpr size_t NUM_ROUNDS = 6;
 // In 2022, before-roundof64 had ~ 16M in South-Midwest, which my Mackbook Air
 // could do in 1.6 seconds.  So we want the threshold higher than that.
 constexpr size_t MONTE_CARLO_THRESHOLD = 100'000'000;
-// constexpr size_t MONTE_CARLO_THRESHOLD = 10;
+// 100,000,000 iters runs out of RAM on Mac Airbook (8 GB).
 constexpr size_t MONTE_CARLO_ITERS = 1'000'000;
 
 using namespace std;
@@ -657,6 +658,56 @@ struct Bracket
 };
 
 vector<Bracket> brackets;
+
+string to_string(const Bracket &bracket)
+{
+   string result;
+   for (game_t match = 0; match < NUM_GAMES; ++match)
+   {
+      if (match == 32)
+      {
+         result += "*****  Round of 32\n";
+      }
+      else if (match == 32 + 16)
+      {
+         result += "*****  Sweet 16\n";
+      }
+      else if (match == 32 + 16 + 8)
+      {
+         result += "*****  Elite 8\n";
+      }
+      else if (match == 32 + 16 + 8 + 4)
+      {
+         result += "*****  Final 4\n";
+      }
+      else if (match == 32 + 16 + 8 + 4 + 2)
+      {
+         result += "*****  Championship\n";
+      }
+      result += to_string(match) + ": " + teams[bracket.picks[match]].name + "\n";
+   }
+   return result;
+}
+
+Bracket make_bracket(const array<bool, NUM_GAMES> &who_wins)
+{
+   Bracket bracket;
+   bracket.name = "Experiment";
+   for (game_t match = 0; match < NUM_GAMES; ++match)
+   {
+      if (match < 32)
+      {
+         // Base case: round of 64.
+         bracket.picks.push_back(match * 2 + (who_wins[match] ? 0 : 1));
+      }
+      else
+      {
+         bracket.picks.push_back(bracket.picks[input(match) + (who_wins[match] ? 0 : 1)]);
+      }
+   }
+
+   return bracket;
+}
 
 vector<bitset<NUM_TEAMS>> all_selections(NUM_GAMES);
 
@@ -1266,7 +1317,11 @@ public:
             rows_.push_back({scoretuple, result_set, cumsum_prob});
             rows_[rows_.size() - 1].result_set.prob = -1;
          }
-         myassert(fabs(total_prob() - rows_[rows_.size() - 1].cumsum_prob) < 1e-13);
+         if (fabs(total_prob() - rows_[rows_.size() - 1].cumsum_prob) > 1e-12)
+         {
+            cout << "total_prob: " << total_prob() << ", computed: " << rows_[rows_.size() - 1].cumsum_prob << ", diff: " << total_prob() - rows_[rows_.size() - 1].cumsum_prob << "\n";
+         }
+         assert(fabs(total_prob() - rows_[rows_.size() - 1].cumsum_prob) < 1e-12);
          frozen_ = true;
       }
       return rows_;
@@ -1386,18 +1441,20 @@ outcomes(
 
    size_t threshold_per_team_pairs = MONTE_CARLO_THRESHOLD / (double)(outcomes1.size() * outcomes2.size());
 
-   auto start = now();
+   // auto start = now();
 
    vector<Outcomes> result(1);
 
+   /*
    if (ri.round <= 1)
    {
       cout << "About to loop, round " << ri.round << endl;
    }
+   */
 
    bool displayed_mc_warning = false;
-   double rows_elapsed = 0;
-   double mc_iters_elapsed = 0;
+   // double rows_elapsed = 0;
+   // double mc_iters_elapsed = 0;
 
    for (const Outcomes &outcome1 : outcomes1)
    {
@@ -1468,12 +1525,12 @@ outcomes(
                double team_pair_prob = outcome1.total_prob() * outcome2.total_prob();
                size_t monte_carlo_iters = max((size_t)(team_pair_prob * MONTE_CARLO_ITERS + 0.5), (size_t)1);
 
-               auto rows_start = now();
+               // auto rows_start = now();
                const vector<Row> &rows1 = outcome1.get_rows();
                const vector<Row> &rows2 = outcome2.get_rows();
-               rows_elapsed += elapsed(rows_start, now());
+               // rows_elapsed += elapsed(rows_start, now());
 
-               auto mc_iters_start = now();
+               // auto mc_iters_start = now();
                for (size_t i = 0; i < monte_carlo_iters; ++i)
                {
                   const Row &rand_row1 = random_row(rows1);
@@ -1482,7 +1539,7 @@ outcomes(
                                rand_row1.result_set, rand_row2.result_set,
                                team_pair_prob / monte_carlo_iters);
                }
-               mc_iters_elapsed += elapsed(mc_iters_start, now());
+               // mc_iters_elapsed += elapsed(mc_iters_start, now());
             }
             else
             {
@@ -1499,6 +1556,7 @@ outcomes(
       }
    }
 
+   /*
    if (ri.round <= 1)
    {
       cout << "Elapsed " << elapsed(start, now()) << " sec.\n";
@@ -1507,6 +1565,7 @@ outcomes(
          cout << "get_rows: " << rows_elapsed << " sec, Monte Carlo iters: " << mc_iters_elapsed << " sec\n";
       }
    }
+   */
 
    return result;
 }
@@ -1629,6 +1688,44 @@ void alternatives(int bracket_to_consider, const vector<team_t> &matches_to_cons
    }
 }
 
+/**********  Probablity of winning  **********/
+
+double prob_win(const array<bool, NUM_GAMES> &choices, int entry)
+{
+   Bracket original = brackets[entry];
+
+   brackets[entry] = make_bracket(choices);
+   make_all_selections();
+
+   auto results = outcomes(NUM_GAMES - 1, {});
+
+   auto win_probs = get_win_probs(results);
+
+   brackets[entry] = original;
+
+   return win_probs[entry].first_place.prob;
+}
+
+pair<array<bool, NUM_GAMES>, double> single_optimize(array<bool, NUM_GAMES> best_choices, double best_prob, int entry_to_optimize, const vector<game_t> &matches)
+{
+   for (game_t match : matches)
+   {
+      array<bool, NUM_GAMES> this_choices = best_choices;
+      this_choices[match] = !this_choices[match];
+
+      double prob = prob_win(this_choices, entry_to_optimize);
+      cout << "+++++ prob after flipping match " << (int)match << " is " << prob * 100 << "% +++++\n";
+      if (prob > best_prob)
+      {
+         cout << "*****  New best!\n";
+         best_choices = this_choices;
+         best_prob = prob;
+      }
+   }
+
+   return make_pair(best_choices, best_prob);
+}
+
 /**********  Putting it all together  **********/
 
 int main(int argc, char *argv[])
@@ -1676,6 +1773,7 @@ int main(int argc, char *argv[])
 
    parse_probs();
 
+   /*
    for (team_t i = 48; i < 48 + 8; i++)
    {
       cout << "Game " << (int)i << ": " << teams[games[i].first_team].name << " vs " << teams[games[i].second_team].name << "\n";
@@ -1683,6 +1781,7 @@ int main(int argc, char *argv[])
    cout << "Game 58 input: " << input(58) << "\n";
    cout << "   " << teams[games[input(58)].first_team].name << ", " << teams[games[input(58)].second_team].name << "\n";
    cout << "Game 61 input: " << input(61) << "\n";
+   */
 
 #if 0
    {
@@ -1787,20 +1886,6 @@ int main(int argc, char *argv[])
       }
    }
 #endif
-   // games[54].winner = games[54].first_team;  // Kansas vs Providence
-
-   // games[53].winner = games[53].first_team; //  Michigan 11 wins (Villanova 2 loses)
-
-   // Outcomes that would most help my win percentage:
-   // games[51].winner = games[51].second_team; // St. Peter's 15 wins (Purdue 3 loses)
-   // games[53].winner = games[53].first_team;  //  Michigan 11 wins (Villanova 2 loses)
-
-   // In order played:
-
-   // games[48].winner = games[48].first_team; // Gonzaga 1 wins (Arkansas 4 loses), 10.00% -> 10.72%
-   // games[53].winner = games[53].first_team; // Michigan 11 wins (Villanova 2 loses) 10.72% -> 13.96%
-   // games[49].winner = games[49].first_team; // Texas Tech 3 wins (Duke 2 loses)
-   // games[52].winner = games[52].first_team; // Arizona 1 wins (Houston 5 loses)
 
    vector<bool> bracket_eliminated(NUM_BRACKETS);
    {
@@ -1808,20 +1893,6 @@ int main(int argc, char *argv[])
       auto start = now();
       auto results = outcomes(62, {});
       cout << "Whole thing elapsed " << elapsed(start, now()) << " sec.\n";
-
-      /*
-      for (const auto &outcome : results)
-      {
-         if (!outcome.result_sets.empty())
-         {
-            cout << to_string(outcome);
-
-            // cout << (outcome.team < 0 ? "other" : teams[outcome.team].name) << ": " << outcome.result_sets.size() << "\n";
-         }
-      }
-      */
-
-      // return 0;
 
       auto win_probs = get_win_probs(results);
 
@@ -1842,6 +1913,38 @@ int main(int argc, char *argv[])
          bracket_eliminated[bracket_num] = win_probs[i].first_place.prob == 0;
       }
    }
+
+   const int entry_to_optimize = 0;
+   // 24.24% chance of winning.
+   // Even though Kansas (Midwest) has a higher chance to win the title than
+   // Arizona (South), the optimizer says to pick Arizona.  Interesting.  In
+   // fact, it says to pick Iowa (5th seed) to beat Arizona (1st seed) in Sweet
+   // 16.
+   // No single flips, even at 50M Monte Carlo iterations.
+   array<bool, NUM_GAMES> who_wins{true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, true, false, false, false, true, true, false, false, true, true, false, false, true, false, false, false, true, true, false, false, true, false, true, true, true, true, true};
+
+   double best_p = prob_win(who_wins, entry_to_optimize);
+   cout << "+++++ Baseline probability: " << best_p * 100 << "% +++++\n";
+   vector<game_t> matches;
+   for (game_t match = 0; match < NUM_GAMES; ++match)
+   {
+      matches.push_back(match);
+   }
+   auto [best_choices, best_prob] = single_optimize(who_wins, best_p, entry_to_optimize, matches);
+
+   cout << to_string(make_bracket(best_choices));
+   bool first = true;
+   cout << "array<bool, NUM_GAMES> who_wins {";
+   for (bool choice : best_choices)
+   {
+      if (!first)
+      {
+         cout << ", ";
+      }
+      cout << (choice ? "true" : "false");
+      first = false;
+   }
+   cout << "};\n";
 
    return 0;
 
