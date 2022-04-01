@@ -702,7 +702,7 @@ struct Bracket
    vector<team_t> picks;
 };
 
-vector<Bracket> brackets;
+// vector<Bracket> brackets;
 
 string to_string(const Bracket &bracket)
 {
@@ -780,6 +780,25 @@ pair<Bracket, array<bool, NUM_GAMES>> make_most_likely_bracket()
    return make_pair(bracket, choices);
 }
 
+void compare(const Bracket &bracket1, const Bracket &bracket2)
+{
+   cout << fmt::format("\n     {:<20} {}\n", bracket1.name, bracket2.name);
+   cout << fmt::format("     ---------------      --------------\n");
+   for (game_t match = 0; match < NUM_GAMES; ++match)
+   {
+      auto iter = INDEX_TO_NAME.find(match);
+      if (iter != INDEX_TO_NAME.end())
+      {
+         cout << iter->second << "\n";
+      }
+      cout << fmt::format("{} {:<2} {:<20} {}\n",
+                          bracket1.picks[match] == bracket2.picks[match] ? " " : "*",
+                          match,
+                          teams[bracket1.picks[match]].name,
+                          teams[bracket2.picks[match]].name);
+   }
+}
+
 vector<bitset<NUM_TEAMS>> all_selections(NUM_GAMES);
 
 string to_string(const bitset<NUM_TEAMS> selections)
@@ -826,7 +845,7 @@ Bracket get_bracket(uint64_t entry)
    return result;
 }
 
-void make_all_selections()
+void make_all_selections(const vector<Bracket> &brackets)
 {
    for (int i = 0; i < NUM_GAMES; i++)
    {
@@ -1294,7 +1313,7 @@ shared_ptr<BoolExpr> and_(unordered_set<shared_ptr<BoolExpr>> children)
 /**********  Outcomes  **********/
 
 scoretuple_t
-get_scoretuple(game_t match_index, team_t winning_team, uint8_t reduced_points)
+get_scoretuple(game_t match_index, team_t winning_team, uint8_t reduced_points, const vector<Bracket> &brackets)
 {
    scoretuple_t scores{0};
 
@@ -1463,7 +1482,8 @@ const Row &random_row(const vector<Row> &rows)
 vector<Outcomes>
 outcomes(
     game_t match_index,
-    bitset<64> selections)
+    bitset<64> selections,
+    const vector<Bracket> &brackets)
 {
    const Matchup &game = games[match_index];
    const auto ri = round_index(match_index + 1);
@@ -1489,7 +1509,7 @@ outcomes(
 
       for (const TeamInfo &team_with_prob : teams_with_probs)
       {
-         auto scores = get_scoretuple(match_index, team_with_prob.team, this_points / 10);
+         auto scores = get_scoretuple(match_index, team_with_prob.team, this_points / 10, brackets);
          assert(team_with_prob.team >= 0);
 
          if (true /* selections[team_with_prob.team] */)
@@ -1507,8 +1527,8 @@ outcomes(
 
    // General case.  Start by recursing.
    int prev_match = input(match_index);
-   const auto outcomes1 = outcomes(prev_match, all_selections[match_index]);
-   const auto outcomes2 = outcomes(prev_match + 1, all_selections[match_index]);
+   const auto outcomes1 = outcomes(prev_match, all_selections[match_index], brackets);
+   const auto outcomes2 = outcomes(prev_match + 1, all_selections[match_index], brackets);
 
    size_t threshold_per_team_pairs = MONTE_CARLO_THRESHOLD / (double)(outcomes1.size() * outcomes2.size());
 
@@ -1584,7 +1604,7 @@ outcomes(
 
             dest->increment_total_prob(winner.result_set.prob * outcome1.total_prob() * outcome2.total_prob());
 
-            auto this_scores = get_scoretuple(match_index, winner.team, this_points / 10);
+            auto this_scores = get_scoretuple(match_index, winner.team, this_points / 10, brackets);
 
             if (outcome1.result_sets.size() * outcome2.result_sets.size() > threshold_per_team_pairs)
             {
@@ -1671,14 +1691,14 @@ get_win_probs(const vector<Outcomes> &outcomes)
    return win_probs;
 }
 
-team_t must_win(game_t match_index, int bracket)
+team_t must_win(game_t match_index, int bracket, const vector<Bracket> &brackets)
 {
    Matchup &matchup = games[match_index];
    auto original_winner = matchup.winner;
 
    matchup.winner = matchup.first_team;
    assert(matchup.winner >= 0);
-   auto win_probs = get_win_probs(outcomes(62, {}));
+   auto win_probs = get_win_probs(outcomes(62, {}, brackets));
    if (win_probs[bracket].first_place.prob == 0)
    {
       matchup.winner = original_winner;
@@ -1687,7 +1707,7 @@ team_t must_win(game_t match_index, int bracket)
 
    matchup.winner = matchup.second_team;
    assert(matchup.winner >= 0);
-   win_probs = get_win_probs(outcomes(62, {}));
+   win_probs = get_win_probs(outcomes(62, {}, brackets));
    if (win_probs[bracket].first_place.prob == 0)
    {
       matchup.winner = original_winner;
@@ -1698,12 +1718,12 @@ team_t must_win(game_t match_index, int bracket)
    return -1;
 }
 
-void alternatives(int bracket_to_consider, const vector<team_t> &matches_to_consider)
+void alternatives(int bracket_to_consider, const vector<team_t> &matches_to_consider, const vector<Bracket> &brackets)
 {
    vector<game_t> single_eliminated;
    for (game_t match_index : matches_to_consider)
    {
-      team_t team_must_win = must_win(match_index, bracket_to_consider);
+      team_t team_must_win = must_win(match_index, bracket_to_consider, brackets);
 
       if (team_must_win > 0)
       {
@@ -1731,7 +1751,7 @@ void alternatives(int bracket_to_consider, const vector<team_t> &matches_to_cons
          {
             continue;
          }
-         team_t team_must_win = must_win(second_match_index, bracket_to_consider);
+         team_t team_must_win = must_win(second_match_index, bracket_to_consider, brackets);
 
          if (team_must_win > 0)
          {
@@ -1748,7 +1768,7 @@ void alternatives(int bracket_to_consider, const vector<team_t> &matches_to_cons
          {
             continue;
          }
-         team_t team_must_win = must_win(second_match_index, bracket_to_consider);
+         team_t team_must_win = must_win(second_match_index, bracket_to_consider, brackets);
 
          if (team_must_win > 0)
          {
@@ -1776,63 +1796,6 @@ array<bool, NUM_GAMES> best_choices_2022{true, false, true, true, true, true, tr
                                          false, true, true, true, true, true};
 */
 
-double prob_win(const array<bool, NUM_GAMES> &choices, int entry)
-{
-   Bracket original = brackets[entry];
-
-   brackets[entry] = make_bracket(choices);
-   make_all_selections();
-
-   auto results = outcomes(NUM_GAMES - 1, {});
-
-   auto win_probs = get_win_probs(results);
-
-   brackets[entry] = original;
-
-   return win_probs[entry].first_place.prob;
-}
-
-pair<array<bool, NUM_GAMES>, double> single_optimize(array<bool, NUM_GAMES> best_choices, double best_prob, int entry_to_optimize, game_t first_match)
-{
-   for (game_t match = first_match; match < NUM_GAMES; ++match)
-   {
-      array<bool, NUM_GAMES> this_choices = best_choices;
-      this_choices[match] = !this_choices[match];
-
-      double prob = prob_win(this_choices, entry_to_optimize);
-      cout << "prob after flipping match " << (int)match << " is " << prob * 100 << "%\n";
-      if (prob > best_prob)
-      {
-         cout << "*****  New best!\n";
-         best_choices = this_choices;
-         best_prob = prob;
-      }
-   }
-
-   return make_pair(best_choices, best_prob);
-}
-
-// In 2022, double_optimize() gave a benefit over single_optimize(): matches 53
-// (Villanova winning Sweet 16) & 58 (Villanova winning Elite 8)
-pair<array<bool, NUM_GAMES>, double> double_optimize(array<bool, NUM_GAMES> best_choices, double best_prob, int entry_to_optimize)
-{
-   for (game_t outer_match = 0; outer_match < NUM_GAMES; ++outer_match)
-   {
-      array<bool, NUM_GAMES> outer_choices = best_choices;
-      outer_choices[outer_match] = !outer_choices[outer_match];
-      double outer_prob = prob_win(outer_choices, entry_to_optimize);
-      cout << "##### Outer.  Best prob so far " << best_prob * 100 << "%, flipping match " << (int)outer_match << " gives probability " << outer_prob * 100 << "%\n";
-      auto [inner_best_choices, inner_best_prob] = single_optimize(outer_choices, outer_prob, entry_to_optimize, max(outer_match + 1, 32));
-      if (inner_best_prob > best_prob)
-      {
-         best_choices = inner_best_choices;
-         best_prob = inner_best_prob;
-         cout << "**********  NEW OVERALL BEST!!  New best prob: " << best_prob * 100 << "%\n";
-      }
-   }
-   return make_pair(best_choices, best_prob);
-}
-
 string to_string(const array<bool, NUM_GAMES> &choices)
 {
    bool first = true;
@@ -1849,23 +1812,153 @@ string to_string(const array<bool, NUM_GAMES> &choices)
    return result + "}";
 }
 
-void compare(const Bracket &bracket1, const Bracket &bracket2)
+double prob_win(const array<bool, NUM_GAMES> &choices, int entry, const vector<Bracket> &orig_brackets)
 {
-   cout << fmt::format("\n     {:<20} {}\n", bracket1.name, bracket2.name);
-   cout << fmt::format("     ---------------      --------------\n");
-   for (game_t match = 0; match < NUM_GAMES; ++match)
+   vector<Bracket> brackets{orig_brackets};
+
+   brackets[entry] = make_bracket(choices);
+   make_all_selections(brackets);
+
+   auto results = outcomes(NUM_GAMES - 1, {}, brackets);
+
+   auto win_probs = get_win_probs(results);
+
+   return win_probs[entry].first_place.prob;
+}
+
+struct Stuff
+{
+   array<bool, NUM_GAMES> choices;
+   string description;
+   double prob = -1;
+};
+
+class OptimGenerator
+{
+public:
+   virtual ~OptimGenerator() {}
+   virtual Stuff operator()() = 0;
+};
+
+class Distributor
+{
+public:
+   Distributor(unique_ptr<OptimGenerator> generator) : generator_(std::move(generator)) {}
+
+private:
+   unique_ptr<OptimGenerator> generator_;
+};
+
+// Could parallelize the optimize stuff:
+// - Have a class that generates the next "choices" array.  Use a mutex to
+//   protect.  Simple.  Worker threads query it in a loop, compute the
+//   probabilitiy, then put that probability, along with the array, on a
+//   "completed work" queue, and release() the counting_semaphore<>.
+// - The main thread pulls from the "completed work" queue, using a
+//   counting_semaphore<> acquire().  It can then decide whether we have a new
+//   "best", and if so, print out whatever it wants, if not, just print a
+//   status.  Basically, the main thread handles all the printing, so we don't
+//   get mixed output lines.
+
+pair<array<bool, NUM_GAMES>, double> single_optimize(array<bool, NUM_GAMES> best_choices, double best_prob, int entry_to_optimize, game_t first_match, const vector<Bracket> &brackets)
+{
+   for (game_t match = first_match; match < NUM_GAMES; ++match)
    {
-      auto iter = INDEX_TO_NAME.find(match);
-      if (iter != INDEX_TO_NAME.end())
+      array<bool, NUM_GAMES> this_choices = best_choices;
+      this_choices[match] = !this_choices[match];
+
+      double prob = prob_win(this_choices, entry_to_optimize, brackets);
+      cout << "prob after flipping match " << (int)match << " is " << prob * 100 << "%\n";
+      if (prob > best_prob)
       {
-         cout << iter->second << "\n";
+         cout << "*****  New best!\n";
+         best_choices = this_choices;
+         best_prob = prob;
       }
-      cout << fmt::format("{} {:<2} {:<20} {}\n",
-                          bracket1.picks[match] == bracket2.picks[match] ? " " : "*",
-                          match,
-                          teams[bracket1.picks[match]].name,
-                          teams[bracket2.picks[match]].name);
    }
+
+   return make_pair(best_choices, best_prob);
+}
+
+// In 2022, double_optimize() gave a benefit over single_optimize(): matches 53
+// (Villanova winning Sweet 16) & 58 (Villanova winning Elite 8)
+pair<array<bool, NUM_GAMES>, double> double_optimize(array<bool, NUM_GAMES> best_choices, double best_prob, int entry_to_optimize, const vector<Bracket> &brackets)
+{
+   for (game_t outer_match = 0; outer_match < NUM_GAMES; ++outer_match)
+   {
+      array<bool, NUM_GAMES> outer_choices = best_choices;
+      outer_choices[outer_match] = !outer_choices[outer_match];
+      double outer_prob = prob_win(outer_choices, entry_to_optimize, brackets);
+      cout << "##### Outer.  Best prob so far " << best_prob * 100 << "%, flipping match " << (int)outer_match << " gives probability " << outer_prob * 100 << "%\n";
+      auto [inner_best_choices, inner_best_prob] = single_optimize(outer_choices, outer_prob, entry_to_optimize, max(outer_match + 1, 32), brackets);
+      if (inner_best_prob > best_prob)
+      {
+         best_choices = inner_best_choices;
+         best_prob = inner_best_prob;
+         cout << "**********  NEW OVERALL BEST!!  New best prob: " << best_prob * 100 << "%\n";
+      }
+   }
+   return make_pair(best_choices, best_prob);
+}
+
+pair<array<bool, NUM_GAMES>, double> all_optimize(array<bool, NUM_GAMES> initial_choices, int entry_to_optimize, const vector<Bracket> &brackets)
+{
+   array<bool, NUM_GAMES> flipped;
+   for (size_t i = 0; i < NUM_GAMES; ++i)
+   {
+      flipped[i] = false;
+   }
+
+   double best_prob = -1;
+   int last_flipped = -1;
+   int last_ever_flipped = NUM_GAMES;
+
+   array<bool, NUM_GAMES> best_choices;
+   for (;;)
+   {
+      array<bool, NUM_GAMES> this_choices;
+      for (size_t i = 0; i < NUM_GAMES; ++i)
+      {
+         this_choices[i] = flipped[i] ? !initial_choices[i] : initial_choices[i];
+      }
+
+      double prob = prob_win(this_choices, entry_to_optimize, brackets);
+      for (int i = last_ever_flipped; i < NUM_GAMES; ++i)
+      {
+         cout << (flipped[i] ? 'F' : 'S');
+      }
+      cout << " last ever flipped " << last_ever_flipped << ", last flipped " << last_flipped << ", prob: " << prob * 100 << "%\n";
+
+      if (prob > best_prob)
+      {
+         cout << "*****  New best!\n";
+         best_choices = this_choices;
+         best_prob = prob;
+
+         compare(make_bracket(best_choices, to_string(prob * 100) + "%"), make_bracket(initial_choices, "Initial"));
+
+         cout << "array<bool, NUM_GAMES> who_wins ";
+         cout << to_string(best_choices) << ";\n";
+      }
+
+      // Update flipped.
+      for (int i = NUM_GAMES - 1; i >= 0; i--)
+      {
+         last_flipped = i;
+         flipped[i] = !flipped[i];
+         if (flipped[i])
+         {
+            break;
+         }
+      }
+
+      if (last_flipped < last_ever_flipped)
+      {
+         last_ever_flipped = last_flipped;
+      }
+   }
+
+   return make_pair(best_choices, best_prob);
 }
 
 /**********  Putting it all together  **********/
@@ -1902,6 +1995,8 @@ int main(int argc, char *argv[])
 #endif
    }
 
+   vector<Bracket> brackets;
+
    for (auto entry : entries)
    {
       brackets.push_back(get_bracket(entry));
@@ -1911,7 +2006,7 @@ int main(int argc, char *argv[])
 
    assert(brackets.size() == NUM_BRACKETS);
 
-   make_all_selections();
+   make_all_selections(brackets);
 
    assert(all_selections.size() == NUM_GAMES);
 
@@ -2038,7 +2133,7 @@ int main(int argc, char *argv[])
    {
       cout << "**********  Whole Thing!\n";
       auto start = now();
-      auto results = outcomes(62, {});
+      auto results = outcomes(62, {}, brackets);
       cout << "Whole thing elapsed " << elapsed(start, now()) << " sec.\n";
 
       auto win_probs = get_win_probs(results);
@@ -2106,16 +2201,22 @@ int main(int argc, char *argv[])
    // compare(make_bracket(double_choices, "Double Optimized"), make_most_likely_bracket());
    */
 
+   /* Found during brute force optimizing, flipping round 54 (2nd last Sweet 16).
+    * 24.99%
+    */
+   // array<bool, NUM_GAMES> brute_force{true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, false, true, true, false, true, true, true, true, true, true, true, true, true, true, true, true, true, false, false, true, false, false, false, true, true, false, false, true, true, false, false, true, true, false, false, true, false, false, false, true, false, false, true, true, true, true};
+
    compare(make_bracket(even_better, "Best so far"), make_most_likely_bracket().first);
 
    cout << "**********  Optimizer!  **********\n";
    array<bool, NUM_GAMES> to_optimize = make_most_likely_bracket().second;
    cout << to_string(make_bracket(to_optimize));
 
-   double best_p = prob_win(to_optimize, entry_to_optimize);
+   double best_p = prob_win(to_optimize, entry_to_optimize, brackets);
    cout << "+++++ Baseline probability: " << best_p * 100 << "% +++++\n";
-   auto [best_choices, best_prob] = single_optimize(to_optimize, best_p, entry_to_optimize, 48);
+   // auto [best_choices, best_prob] = single_optimize(to_optimize, best_p, entry_to_optimize, 48);
    // auto [best_choices, best_prob] = double_optimize(to_optimize, best_p, entry_to_optimize);
+   auto [best_choices, best_prob] = all_optimize(to_optimize, entry_to_optimize, brackets);
 
    cout << to_string(make_bracket(best_choices));
    cout << "array<bool, NUM_GAMES> who_wins ";
@@ -2144,12 +2245,12 @@ int main(int argc, char *argv[])
       auto original_winner = matchup.winner;
 
       matchup.winner = matchup.first_team;
-      auto results = outcomes(62, {});
+      auto results = outcomes(62, {}, brackets);
       auto win_probs = get_win_probs(results);
       alternate_win_probs.push_back({match_index, true, matchup.winner, win_probs[bracket_to_consider].first_place.prob});
 
       matchup.winner = matchup.second_team;
-      results = outcomes(62, {});
+      results = outcomes(62, {}, brackets);
       win_probs = get_win_probs(results);
       alternate_win_probs.push_back({match_index, false, matchup.winner, win_probs[bracket_to_consider].first_place.prob});
 
@@ -2170,7 +2271,7 @@ int main(int argc, char *argv[])
          continue;
       }
       cout << "**********  " << brackets[bracket_to_consider].name << "  **********\n";
-      alternatives(bracket_to_consider, matches_to_consider);
+      alternatives(bracket_to_consider, matches_to_consider, brackets);
    }
 
    return 0;
