@@ -110,11 +110,14 @@
 #include <fmt/format.h>
 #include <bitset>
 #include <unordered_set>
+#include <queue>
 #include <bit>
 #include <curl/curl.h>
 #include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
+#include <semaphore>
+#include <thread>
 
 #define WITH_BOOLEXPR 0
 
@@ -1817,7 +1820,7 @@ double prob_win(const array<bool, NUM_GAMES> &choices, int entry, const vector<B
    vector<Bracket> brackets{orig_brackets};
 
    brackets[entry] = make_bracket(choices);
-   make_all_selections(brackets);
+   // make_all_selections(brackets);
 
    auto results = outcomes(NUM_GAMES - 1, {}, brackets);
 
@@ -1825,6 +1828,68 @@ double prob_win(const array<bool, NUM_GAMES> &choices, int entry, const vector<B
 
    return win_probs[entry].first_place.prob;
 }
+
+// Actually, maybe we don't want this.  Maybe each worker thread, when it's
+// done, can just call an update function on its own thread, before it gets more
+// work.  That probably makes the most sense.  Oh well.
+// Unbounded.
+// I think we need to know how many producers there are, so when they're all
+// done, we can wake up all the consumers and tell them all to go home.
+template <typename T>
+class ProducerConsumerQueue
+{
+public:
+   // num_producers and num_consumers are only needed during shutdown: we wait
+   // for num_producers calls to producer_done(), then release num_consumer
+   // callers blocked on consume().
+   ProducerConsumerQueue(size_t num_producers, size_t num_consumers) : num_producers_(num_producers), num_consumers_(num_consumers), semaphore_(0) {}
+
+   void produce(T &&result)
+   {
+      {
+         scoped_lock lock{mutex_};
+         queue_.push(move(result));
+      }
+      semaphore_.release();
+   }
+
+   optional<T> consume()
+   {
+      semaphore_.acquire();
+
+      scoped_lock lock{mutex_};
+      // The documentation for acquire() doesn't mention spurious wake ups.
+      // Let's see if they happen.
+      assert(!queue_.empty());
+
+      optional<T> ret = queue_.front();
+      queue_.pop();
+      return ret;
+   }
+
+   void producer_done()
+   {
+      if (--num_producers_ == 0)
+      {
+         {
+            scoped_lock lock{mutex_};
+            for (int i = 0; i < num_consumers_; ++i)
+            {
+               queue_.emplace(nullopt);
+            }
+         }
+         semaphore_.release(num_consumers_);
+      }
+   }
+
+private:
+   atomic<size_t> num_producers_;
+   const size_t num_consumers_;
+
+   counting_semaphore<> semaphore_;
+   mutex mutex_;
+   queue<optional<T>> queue_;
+};
 
 struct Stuff
 {
@@ -1837,16 +1902,91 @@ class OptimGenerator
 {
 public:
    virtual ~OptimGenerator() {}
-   virtual Stuff operator()() = 0;
+   virtual optional<Stuff> get() = 0;
+   virtual void new_best(const Stuff &stuff) = 0;
 };
 
 class Distributor
 {
 public:
-   Distributor(unique_ptr<OptimGenerator> generator) : generator_(std::move(generator)) {}
+   Distributor(unique_ptr<OptimGenerator> generator, int entry_to_optimize, const vector<Bracket> &brackets, int num_threads = thread::hardware_concurrency()) : generator_(std::move(generator)),
+                                                                                                                                                                 entry_to_optimize_(entry_to_optimize), brackets(brackets),
+                                                                                                                                                                 queue_(num_threads, 1)
+   {
+      for (size_t i = 0; i < num_threads; ++i)
+      {
+         workers_.emplace_back(&Distributor::worker, this);
+      }
+   }
+
+   ~Distributor()
+   {
+      // We don't really need to join on all the threads here, it might be a
+      // little simpler to detach threads as soon as we create them.  But
+      // somehow, cleaning up after ourselves feels better.
+      for (auto &worker : workers_)
+      {
+         worker.join();
+      }
+   }
+
+   optional<Stuff> get_result()
+   {
+      return queue_.consume();
+   }
+
+   pair<array<bool, NUM_GAMES>, double> loop(double best_prob)
+   {
+      array<bool, NUM_GAMES> best_choices;
+      while (optional<Stuff> stuff = get_result())
+      {
+         cout << stuff->description << ", prob: " << stuff->prob * 100 << "%\n";
+         if (stuff->prob > best_prob)
+         {
+            cout << "*****  New best!\n";
+            best_choices = stuff->choices;
+            best_prob = stuff->prob;
+
+            scoped_lock mylock(generator_mutex_);
+            generator_->new_best(*stuff);
+         }
+      }
+
+      return make_pair(best_choices, best_prob);
+   }
 
 private:
+   optional<Stuff> get_work()
+   {
+      scoped_lock mylock(generator_mutex_);
+      return generator_->get();
+   }
+
+   void worker()
+   {
+      for (;;)
+      {
+         optional<Stuff> work = get_work();
+         if (!work)
+         {
+            queue_.producer_done();
+            return;
+         }
+         double prob = prob_win(work->choices, entry_to_optimize_, brackets);
+         work->prob = prob;
+         queue_.produce(move(*work));
+      }
+   }
+
+   mutex generator_mutex_;
    unique_ptr<OptimGenerator> generator_;
+
+   const int entry_to_optimize_;
+   const vector<Bracket> &brackets;
+
+   ProducerConsumerQueue<Stuff> queue_;
+
+   vector<thread> workers_;
 };
 
 // Could parallelize the optimize stuff:
@@ -1878,6 +2018,62 @@ pair<array<bool, NUM_GAMES>, double> single_optimize(array<bool, NUM_GAMES> best
    }
 
    return make_pair(best_choices, best_prob);
+}
+
+// Should really be a coroutine.  Hmm.
+class SingleGenerator : public OptimGenerator
+{
+public:
+   SingleGenerator(array<bool, NUM_GAMES> best_choices) : best_choices_(move(best_choices)) {}
+
+   // Later, we can make this the consumer too I guess, so it can base future
+   // Stuff on best so far.
+   optional<Stuff> get() override
+   {
+      cout << "Generating " << (int)next_match << "\n";
+      if (next_match >= NUM_GAMES)
+      {
+         return nullopt;
+      }
+
+      Stuff ret;
+      ret.choices = best_choices_;
+      ret.choices[next_match] = !ret.choices[next_match];
+      ret.description = "Flipping match " + to_string((int)next_match);
+
+      ++next_match;
+
+      return ret;
+   }
+
+   void new_best(const Stuff &stuff) override
+   {
+      best_choices_ = stuff.choices;
+   }
+
+   array<bool, NUM_GAMES> best_choices_;
+   game_t next_match{0};
+};
+
+pair<array<bool, NUM_GAMES>, double> single_optimize_p(array<bool, NUM_GAMES> best_choices, double best_prob, int entry_to_optimize, const vector<Bracket> &brackets)
+{
+   Distributor distrib(make_unique<SingleGenerator>(best_choices), entry_to_optimize, brackets);
+
+   return distrib.loop(best_prob);
+   /*
+      while (optional<Stuff> stuff = distrib.get_result())
+      {
+         cout << "prob after flipping match " << stuff->description << " is " << stuff->prob * 100 << "%\n";
+         if (stuff->prob > best_prob)
+         {
+            cout << "*****  New best!\n";
+            best_choices = stuff->choices;
+            best_prob = stuff->prob;
+         }
+      }
+
+   return make_pair(best_choices, best_prob);
+   */
 }
 
 // In 2022, double_optimize() gave a benefit over single_optimize(): matches 53
@@ -2214,11 +2410,21 @@ int main(int argc, char *argv[])
 
    double best_p = prob_win(to_optimize, entry_to_optimize, brackets);
    cout << "+++++ Baseline probability: " << best_p * 100 << "% +++++\n";
-   // auto [best_choices, best_prob] = single_optimize(to_optimize, best_p, entry_to_optimize, 48);
-   // auto [best_choices, best_prob] = double_optimize(to_optimize, best_p, entry_to_optimize);
-   auto [best_choices, best_prob] = all_optimize(to_optimize, entry_to_optimize, brackets);
+#if 0
+   auto start = now();
+   /* auto [best_choices, best_prob] =*/single_optimize(to_optimize, best_p,
+                                                        entry_to_optimize, 0, brackets);
+   cout << "##### serial elapsed " << elapsed(start, now()) << " sec.\n";
+#endif
+   auto start = now();
+   auto [best_choices, best_prob] = single_optimize_p(to_optimize, best_p, entry_to_optimize, brackets);
+   cout << "##### parallel elapsed " << elapsed(start, now()) << " sec.\n";
 
-   cout << to_string(make_bracket(best_choices));
+   // auto [best_choices, best_prob] = double_optimize(to_optimize, best_p, entry_to_optimize);
+   // auto [best_choices, best_prob] = all_optimize(to_optimize, entry_to_optimize, brackets);
+
+   // cout << to_string(make_bracket(best_choices));
+   compare(make_bracket(best_choices, "Optimized"), make_bracket(to_optimize, "Initial"));
    cout << "array<bool, NUM_GAMES> who_wins ";
    cout << to_string(best_choices) << ";\n";
    return 0;
