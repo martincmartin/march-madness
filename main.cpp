@@ -117,7 +117,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <semaphore>
+#include <mutex>
 #include <thread>
+#include <optional>
 
 #define WITH_BOOLEXPR 0
 
@@ -2218,10 +2220,10 @@ int main(int argc, char *argv[])
    cout << "Game 61 input: " << input(61) << "\n";
    */
 
+#if 0
    compare(brackets[6], make_most_likely_bracket().first);
    compare(brackets[7], make_most_likely_bracket().first);
 
-#if 0
    {
       cout << "**********  Top Round of 32 game in the South\n";
       // matches: 16, 17, 40
@@ -2323,7 +2325,6 @@ int main(int argc, char *argv[])
          }
       }
    }
-#endif
 
    vector<bool> bracket_eliminated(NUM_BRACKETS);
    {
@@ -2351,6 +2352,7 @@ int main(int argc, char *argv[])
          bracket_eliminated[bracket_num] = win_probs[i].first_place.prob == 0;
       }
    }
+#endif
 
    const int entry_to_optimize = 0;
    // Even though Kansas (Midwest) has a higher chance to win the title than
@@ -2410,15 +2412,16 @@ int main(int argc, char *argv[])
 
    double best_p = prob_win(to_optimize, entry_to_optimize, brackets);
    cout << "+++++ Baseline probability: " << best_p * 100 << "% +++++\n";
-#if 0
+
    auto start = now();
    /* auto [best_choices, best_prob] =*/single_optimize(to_optimize, best_p,
                                                         entry_to_optimize, 0, brackets);
    cout << "##### serial elapsed " << elapsed(start, now()) << " sec.\n";
-#endif
-   auto start = now();
+
+#if 0
+   auto startp = now();
    auto [best_choices, best_prob] = single_optimize_p(to_optimize, best_p, entry_to_optimize, brackets);
-   cout << "##### parallel elapsed " << elapsed(start, now()) << " sec.\n";
+   cout << "##### parallel elapsed " << elapsed(startp, now()) << " sec.\n";
 
    // auto [best_choices, best_prob] = double_optimize(to_optimize, best_p, entry_to_optimize);
    // auto [best_choices, best_prob] = all_optimize(to_optimize, entry_to_optimize, brackets);
@@ -2427,8 +2430,10 @@ int main(int argc, char *argv[])
    compare(make_bracket(best_choices, "Optimized"), make_bracket(to_optimize, "Initial"));
    cout << "array<bool, NUM_GAMES> who_wins ";
    cout << to_string(best_choices) << ";\n";
+#endif
    return 0;
 
+#if 0
    struct AlternateWinProb
    {
       game_t match;
@@ -2481,4 +2486,5 @@ int main(int argc, char *argv[])
    }
 
    return 0;
+#endif
 }
