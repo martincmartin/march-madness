@@ -70,6 +70,11 @@
 //
 // If you try it at Round of 64, that's 32 * 32 = 1024, still faster than
 // double_optimize(), which took almost 3 hours on Crystal (Ubuntu).
+//
+// Note that, after round of 32, we typically only have 6 sets of unique
+// score-tuples, along with winning team, rather than 8.  In fact, in 2022, of
+// the 16 round-of-32 games, we had 13 with just 6 Outcomes, and only 3 with the
+// full 8 Outcomes.
 
 // **********  Other Notes  **********
 
